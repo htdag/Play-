@@ -285,6 +285,8 @@ void CChannel::ExecuteSourceChain()
 	//Execute current
 	if(m_nQWC != 0)
 	{
+		goto continue_execution;
+
 		uint32 nRecv = m_receive(m_nMADR, m_nQWC, CHCR_DIR_FROM, false);
 
 		m_nMADR += nRecv * 0x10;
@@ -455,6 +457,9 @@ void CChannel::ExecuteSourceChain()
 		{
 			continue;
 		}
+
+continue_execution:
+		nID = m_CHCR.nTAG >> 12;
 
 		uint32 qwc = m_nQWC;
 		if((nID == DMATAG_SRC_CNT) && isMfifo)

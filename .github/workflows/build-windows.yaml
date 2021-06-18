@@ -70,7 +70,7 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake .. -G"${{ matrix.build-type }}" -A ${{ matrix.target-platform }} -T v141_xp -DUSE_QT=on -DBUILD_LIBRETRO_CORE=yes
+        cmake .. -G"${{ matrix.build-type }}" -A ${{ matrix.target-platform }} -T v141_xp -DUSE_QT=on -DDEBUGGER_INCLUDED=on
     - name: Build
       run: |
         cd build

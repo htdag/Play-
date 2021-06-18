@@ -54,7 +54,7 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake .. -G"Xcode" -DBUILD_LIBRETRO_CORE=yes "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+        cmake .. -G"Xcode" -DDEBUGGER_INCLUDED=on "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
     - name: Build
       run: |
         cd build

@@ -30,7 +30,7 @@ if(BUILD_AOT_CACHE)
 	list(APPEND DEFINITIONS_LIST AOT_BUILD_CACHE=1)
 endif()
 
-if(TARGET_PLATFORM_ANDROID OR TARGET_PLATFORM_IOS OR BUILD_AOT_CACHE)
+if(TARGET_PLATFORM_ANDROID OR TARGET_PLATFORM_IOS OR TARGET_PLATFORM_JS OR BUILD_AOT_CACHE)
 	list(APPEND DEFINITIONS_LIST DISABLE_LOGGING=1)
 endif()
 
@@ -43,6 +43,7 @@ if(NOT TARGET Framework)
 	add_subdirectory(
 		${CMAKE_CURRENT_SOURCE_DIR}/../deps/Framework/build_cmake/Framework
 		${CMAKE_CURRENT_BINARY_DIR}/Framework
+		EXCLUDE_FROM_ALL
 	)
 endif()
 list(APPEND PROJECT_LIBS Framework)
@@ -52,6 +53,7 @@ if(ENABLE_AMAZON_S3)
 		add_subdirectory(
 			${CMAKE_CURRENT_SOURCE_DIR}/../deps/Framework/build_cmake/FrameworkAmazon
 			${CMAKE_CURRENT_BINARY_DIR}/FrameworkAmazon
+			EXCLUDE_FROM_ALL
 		)
 	endif()
 	list(APPEND PROJECT_LIBS Framework_Amazon)
@@ -76,6 +78,7 @@ if(NOT BZIP2_FOUND)
 		add_subdirectory(
 			${CMAKE_CURRENT_SOURCE_DIR}/../deps/Dependencies/build_cmake/bzip2-1.0.6
 			${CMAKE_CURRENT_BINARY_DIR}/bzip2-1.0.6
+			EXCLUDE_FROM_ALL
 		)
 	endif()
 	list(APPEND PROJECT_LIBS BZip2::BZip2)
@@ -91,6 +94,7 @@ if(NOT ZLIB_FOUND)
 		add_subdirectory(
 			${CMAKE_CURRENT_SOURCE_DIR}/../deps/Dependencies/build_cmake/zlib-1.2.8
 			${CMAKE_CURRENT_BINARY_DIR}/zlib-1.2.8
+			EXCLUDE_FROM_ALL
 		)
 	endif()
 endif()
@@ -101,6 +105,15 @@ find_package(ICUUC)
 if(ICUUC_FOUND)
 	list(APPEND PROJECT_LIBS ${ICUUC_LIBRARIES})
 endif()
+
+if(NOT TARGET libchdr)
+	add_subdirectory(
+		${CMAKE_CURRENT_SOURCE_DIR}/../deps/libchdr/
+		${CMAKE_CURRENT_BINARY_DIR}/libchdr
+		EXCLUDE_FROM_ALL
+	)
+endif()
+list(APPEND PROJECT_LIBS chdr-static)
 
 if(NOT (TARGET_PLATFORM_ANDROID OR TARGET_PLATFORM_IOS))
 	set(THREADS_PREFER_PTHREAD_FLAG ON)
@@ -123,6 +136,10 @@ set(COMMON_SRC_FILES
 	COP_SCU.cpp
 	COP_SCU.h
 	COP_SCU_Reflection.cpp
+	discimages/ChdImageStream.cpp
+	discimages/ChdImageStream.h
+	discimages/ChdStreamSupport.cpp
+	discimages/ChdStreamSupport.h
 	discimages/CsoImageStream.cpp
 	discimages/CsoImageStream.h
 	discimages/CueSheet.cpp
@@ -140,6 +157,10 @@ set(COMMON_SRC_FILES
 	ee/DMAC.h
 	ee/Dmac_Channel.cpp
 	ee/Dmac_Channel.h
+	ee/EeBasicBlock.cpp
+	ee/EeBasicBlock.h
+	ee/Ee_IdleEvaluator.cpp
+	ee/Ee_IdleEvaluator.h
 	ee/Ee_LibMc2.cpp
 	ee/Ee_LibMc2.h
 	ee/Ee_SubSystem.cpp
@@ -215,6 +236,7 @@ set(COMMON_SRC_FILES
 	GenericMipsExecutor.h
 	gs/GsCachedArea.cpp
 	gs/GsCachedArea.h
+	gs/GsDebuggerInterface.h
 	gs/GSH_Null.cpp
 	gs/GSH_Null.h
 	gs/GSHandler.cpp
@@ -236,10 +258,15 @@ set(COMMON_SRC_FILES
 	iop/ioman/HardDiskDevice.h
 	iop/ioman/OpticalMediaDevice.cpp
 	iop/ioman/OpticalMediaDevice.h
+	iop/ioman/OpticalMediaDirectoryIterator.cpp
+	iop/ioman/OpticalMediaDirectoryIterator.h
 	iop/ioman/PathDirectoryDevice.h
+	iop/ioman/PathDirectoryIterator.cpp
+	iop/ioman/PathDirectoryIterator.h
 	iop/ioman/PreferenceDirectoryDevice.h
 	iop/Ioman_Defs.h
 	iop/Ioman_Device.h
+	iop/Ioman_DirectoryIterator.h
 	iop/Ioman_ScopedFile.cpp
 	iop/Ioman_ScopedFile.h
 	iop/Iop_Cdvdfsv.cpp
@@ -266,12 +293,16 @@ set(COMMON_SRC_FILES
 	iop/Iop_FileIoHandler2200.h
 	iop/Iop_Heaplib.cpp
 	iop/Iop_Heaplib.h
+	iop/Iop_Ilink.cpp
+	iop/Iop_Ilink.h
 	iop/Iop_Intc.cpp
 	iop/Iop_Intc.h
 	iop/Iop_Intrman.cpp
 	iop/Iop_Intrman.h
 	iop/Iop_Ioman.cpp
 	iop/Iop_Ioman.h
+	iop/Iop_IomanX.cpp
+	iop/Iop_IomanX.h
 	iop/Iop_LibSd.cpp
 	iop/Iop_LibSd.h
 	iop/Iop_Loadcore.cpp
@@ -288,6 +319,8 @@ set(COMMON_SRC_FILES
 	iop/Iop_PadMan.h
 	iop/Iop_PathUtils.cpp
 	iop/Iop_PathUtils.h
+	iop/Iop_PowerOff.cpp
+	iop/Iop_PowerOff.h
 	iop/Iop_RootCounters.cpp
 	iop/Iop_RootCounters.h
 	iop/Iop_Secrman.cpp
@@ -444,13 +477,21 @@ set(COMMON_SRC_FILES
 	${AMAZON_S3_SRC}
 )
 
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+	add_compile_options("-fbracket-depth=512")
+endif()
+
 if(TARGET_PLATFORM_WIN32)
 	set(PLATFORM_SPECIFIC_SRC_FILES VolumeStream.cpp)
 	list(APPEND PROJECT_LIBS winmm)
 endif()
 
-if(TARGET_PLATFORM_MACOS OR TARGET_PLATFORM_UNIX)
+if(TARGET_PLATFORM_MACOS OR TARGET_PLATFORM_UNIX OR TARGET_PLATFORM_JS)
 	set(PLATFORM_SPECIFIC_SRC_FILES Posix_VolumeStream.cpp)
+endif()
+
+if(TARGET_PLATFORM_JS)
+	set(PLATFORM_SPECIFIC_SRC_FILES ${PLATFORM_SPECIFIC_SRC_FILES} Js_DiscImageDeviceStream.cpp Js_DiscImageDeviceStream.h)
 endif()
 
 add_library(PlayCore STATIC ${COMMON_SRC_FILES} ${PLATFORM_SPECIFIC_SRC_FILES})

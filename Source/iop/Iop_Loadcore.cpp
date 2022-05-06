@@ -217,10 +217,10 @@ bool CLoadcore::LoadModule(uint32* args, uint32 argsSize, uint32* ret, uint32 re
 	//Load the module
 	CLog::GetInstance().Print(LOG_NAME, "Request to load module '%s' received with %d bytes arguments payload.\r\n", moduleName, moduleArgsSize);
 
-	auto moduleId = m_bios.LoadModule(moduleName);
+	auto moduleId = m_bios.LoadModuleFromPath(moduleName);
 	if(moduleId >= 0)
 	{
-		moduleId = m_bios.StartModule(moduleId, moduleName, moduleArgs, moduleArgsSize);
+		moduleId = m_bios.StartModule(CIopBios::MODULESTARTREQUEST_SOURCE::REMOTE, moduleId, moduleName, moduleArgs, moduleArgsSize);
 	}
 
 	//This function returns something negative upon failure
@@ -269,10 +269,10 @@ void CLoadcore::LoadModuleFromMemory(uint32* args, uint32 argsSize, uint32* ret,
 	const char* moduleArgs = reinterpret_cast<const char*>(args) + 8 + PATH_MAX_SIZE;
 	uint32 moduleArgsSize = args[1];
 	CLog::GetInstance().Print(LOG_NAME, "Request to load module at 0x%08X received with %d bytes arguments payload.\r\n", args[0], moduleArgsSize);
-	auto moduleId = m_bios.LoadModule(args[0]);
+	auto moduleId = m_bios.LoadModuleFromAddress(args[0]);
 	if(moduleId >= 0)
 	{
-		moduleId = m_bios.StartModule(moduleId, "", moduleArgs, moduleArgsSize);
+		moduleId = m_bios.StartModule(CIopBios::MODULESTARTREQUEST_SOURCE::REMOTE, moduleId, "", moduleArgs, moduleArgsSize);
 	}
 	ret[0] = moduleId;
 	ret[1] = 0; //Result of module's start() function
@@ -300,7 +300,7 @@ bool CLoadcore::StopModule(uint32* args, uint32 argsSize, uint32* ret, uint32 re
 		return true;
 	}
 
-	auto result = m_bios.StopModule(moduleId);
+	auto result = m_bios.StopModule(CIopBios::MODULESTARTREQUEST_SOURCE::REMOTE, moduleId);
 	ret[0] = result;
 
 	if(result >= 0)

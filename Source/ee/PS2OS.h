@@ -12,6 +12,7 @@
 #include "../OsStructQueue.h"
 #include "../gs/GSHandler.h"
 #include "SIF.h"
+#include "Ee_IdleEvaluator.h"
 #include "Ee_LibMc2.h"
 
 #define INTERRUPTS_ENABLED_MASK (CMIPS::STATUS_IE | CMIPS::STATUS_EIE)
@@ -44,11 +45,18 @@ public:
 	std::pair<uint32, uint32> GetExecutableRange() const;
 	uint32 LoadExecutable(const char*, const char*);
 
-	void HandleInterrupt();
+	Ee::CLibMc2& GetLibMc2();
+
+	void HandleInterrupt(int32);
 	void HandleSyscall();
 	void HandleReturnFromException();
 	void HandleTLBException();
 	bool CheckVBlankFlag();
+
+	uint32 SuspendCurrentThread();
+	void ResumeThread(uint32);
+
+	uint8* GetStructPtr(uint32) const;
 
 	void UpdateTLBEnabledState();
 
@@ -106,6 +114,7 @@ private:
 		uint32 count;
 		uint32 maxCount;
 		uint32 waitCount;
+		uint32 waitNextId;
 		uint32 option;
 	};
 
@@ -177,6 +186,7 @@ private:
 	{
 		uint32 isValid;
 		uint32 delay;
+		uint32 compare;
 		uint32 callback;
 		uint32 callbackParam;
 		uint32 gp;
@@ -317,12 +327,14 @@ private:
 	void ThreadReset(uint32);
 	void CheckLivingThreads();
 
-	bool SemaReleaseSingleThread(uint32, bool);
+	void SemaLinkThread(uint32, uint32);
+	void SemaUnlinkThread(uint32, uint32);
+	void SemaReleaseSingleThread(uint32, bool);
+
+	void AlarmUpdateCompare();
 
 	std::pair<uint32, uint32> GetVsyncFlagPtrs() const;
 	void SetVsyncFlagPtrs(uint32, uint32);
-
-	uint8* GetStructPtr(uint32) const;
 
 	uint32 GetNextAvailableDeci2HandlerId();
 	DECI2HANDLER* GetDeci2Handler(uint32);
@@ -401,6 +413,7 @@ private:
 	OsVariableWrapper<uint32> m_idleThreadId;
 	OsVariableWrapper<uint32> m_tlblExceptionHandler;
 	OsVariableWrapper<uint32> m_tlbsExceptionHandler;
+	OsVariableWrapper<uint32> m_trapExceptionHandler;
 	OsVariableWrapper<uint32> m_sifDmaNextIdx;
 
 	uint32* m_sifDmaTimes = nullptr;
@@ -418,6 +431,7 @@ private:
 	CSIF& m_sif;
 	Ee::CLibMc2 m_libMc2;
 	CIopBios& m_iopBios;
+	Ee::CIdleEvaluator m_idleEvaluator;
 
 #ifdef DEBUGGER_INCLUDED
 	static const SYSCALL_NAME g_syscallNames[];

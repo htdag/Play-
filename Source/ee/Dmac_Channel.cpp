@@ -106,7 +106,7 @@ void CChannel::Execute()
 {
 	if(m_CHCR.nSTR != 0)
 	{
-		if(m_dmac.m_D_ENABLE)
+		if(m_dmac.m_D_ENABLE & CDMAC::ENABLE_CPND)
 		{
 			//TODO: Need to check cases where this is done on channels other than 4
 			assert(m_number == CDMAC::CHANNEL_ID_TO_IPU);
@@ -197,6 +197,8 @@ void CChannel::ExecuteNormal()
 	m_nMADR += nRecv * 0x10;
 	m_nQWC -= nRecv;
 
+	m_nQWC &= CDMAC::QWC_WRITE_MASK;
+
 	if(m_nQWC == 0)
 	{
 		ClearSTR();
@@ -262,13 +264,13 @@ void CChannel::ExecuteSourceChain()
 	bool isStallDrainChannel = false;
 	switch(m_dmac.m_D_CTRL.std)
 	{
-	case 0:
+	case CDMAC::D_CTRL_STD_NONE:
 		isStallDrainChannel = false;
 		break;
-	case 1:
+	case CDMAC::D_CTRL_STD_VIF1:
 		isStallDrainChannel = (m_number == CDMAC::CHANNEL_ID_VIF1);
 		break;
-	case 2:
+	case CDMAC::D_CTRL_STD_GIF:
 		isStallDrainChannel = (m_number == CDMAC::CHANNEL_ID_GIF);
 		break;
 	default:
@@ -285,10 +287,7 @@ void CChannel::ExecuteSourceChain()
 	//Execute current
 	if(m_nQWC != 0)
 	{
-		uint32 nRecv = m_receive(m_nMADR, m_nQWC, CHCR_DIR_FROM, false);
-
-		m_nMADR += nRecv * 0x10;
-		m_nQWC -= nRecv;
+		ExecuteSourceChainTransfer(isMfifo);
 
 		if(m_nQWC != 0)
 		{
@@ -333,7 +332,7 @@ void CChannel::ExecuteSourceChain()
 				}
 				else
 				{
-					if(CDMAC::IsEndSrcTagId((uint32)m_CHCR.nTAG << 16))
+					if(CDMAC::IsEndSrcTagId(m_CHCR.nTAG))
 					{
 						ClearSTR();
 						continue;
@@ -456,42 +455,7 @@ void CChannel::ExecuteSourceChain()
 			continue;
 		}
 
-		uint32 qwc = m_nQWC;
-		if((nID == DMATAG_SRC_CNT) && isMfifo)
-		{
-			//Adjust QWC in MFIFO mode
-			uint32 ringBufferAddr = m_nMADR - m_dmac.m_D_RBOR;
-			uint32 ringBufferSize = m_dmac.m_D_RBSR + 0x10;
-			assert(ringBufferAddr <= ringBufferSize);
-
-			qwc = std::min<int32>(m_nQWC, (ringBufferSize - ringBufferAddr) / 0x10);
-		}
-
-		if(qwc != 0)
-		{
-			uint32 nRecv = m_receive(m_nMADR, qwc, CHCR_DIR_FROM, false);
-
-			m_nMADR += nRecv * 0x10;
-			m_nQWC -= nRecv;
-		}
-
-		if(isMfifo)
-		{
-			if(nID == DMATAG_SRC_CNT)
-			{
-				//Loop MADR if needed
-				uint32 ringBufferSize = m_dmac.m_D_RBSR + 0x10;
-				if(m_nMADR == (m_dmac.m_D_RBOR + ringBufferSize))
-				{
-					m_nMADR = m_dmac.m_D_RBOR;
-				}
-			}
-
-			//Mask TADR because it's in the ring buffer zone
-			m_nTADR -= m_dmac.m_D_RBOR;
-			m_nTADR &= m_dmac.m_D_RBSR;
-			m_nTADR += m_dmac.m_D_RBOR;
-		}
+		ExecuteSourceChainTransfer(isMfifo);
 	}
 }
 
@@ -501,24 +465,36 @@ void CChannel::ExecuteDestinationChain()
 
 	while(m_CHCR.nSTR == 1)
 	{
-		assert(m_nQWC == 0);
-
-		auto tag = make_convertible<DMAtag>(m_dmac.FetchDMATag(m_dmac.m_D8_SADR | 0x80000000));
-		m_dmac.m_D8_SADR += 0x10;
-
-		assert(tag.irq == 0);
-		assert(tag.pce == 0);
-		assert((tag.addr & 0x0F) == 0);
-		switch(tag.id)
+		//QWC is 0, fetch a new tag
+		//Some games don't reset the TAG value in CHCR and start a transfer that looks like a normal transfer
+		//I guess this is because TAG is still the end tag and the DMAC only fetches a new tag if it's started with QWC = 0
+		//- Hitman 2: Silent Assassin
+		//- Ridge Racer 5
+		if(m_nQWC == 0)
 		{
-		case DMATAG_DST_CNT:
-		case DMATAG_DST_END:
-			m_nMADR = tag.addr;
-			m_nQWC = tag.qwc;
-			break;
-		default:
-			assert(false);
-			break;
+			auto tag = make_convertible<DMAtag>(m_dmac.FetchDMATag(m_dmac.m_D8_SADR | 0x80000000));
+			m_dmac.m_D8_SADR += 0x10;
+
+			assert(tag.irq == 0);
+			assert(tag.pce == 0);
+			assert((tag.addr & 0x0F) == 0);
+			switch(tag.id)
+			{
+			case DMATAG_DST_CNTS:
+				//Stall register update not supported yet
+				assert(m_dmac.m_D_CTRL.sts != CDMAC::D_CTRL_STS_FROM_SPR);
+				[[fallthrough]];
+			case DMATAG_DST_CNT:
+			case DMATAG_DST_END:
+				m_nMADR = tag.addr;
+				m_nQWC = tag.qwc;
+				break;
+			default:
+				assert(false);
+				break;
+			}
+
+			m_CHCR.nTAG = static_cast<uint16>(tag >> 16);
 		}
 
 		uint32 recv = m_receive(m_nMADR, m_nQWC, m_CHCR.nDIR, false);
@@ -527,7 +503,7 @@ void CChannel::ExecuteDestinationChain()
 		m_nMADR += recv * 0x10;
 		m_nQWC -= recv;
 
-		if(tag.id == DMATAG_DST_END)
+		if(CDMAC::IsEndDstTagId(m_CHCR.nTAG))
 		{
 			ClearSTR();
 		}
@@ -537,6 +513,54 @@ void CChannel::ExecuteDestinationChain()
 void CChannel::SetReceiveHandler(const DmaReceiveHandler& handler)
 {
 	m_receive = handler;
+}
+
+void CChannel::ExecuteSourceChainTransfer(bool isMfifo)
+{
+	uint32 nID = m_CHCR.nTAG >> 12;
+
+	uint32 qwc = m_nQWC;
+	if((nID == DMATAG_SRC_CNT) && isMfifo)
+	{
+		//Adjust QWC in MFIFO mode
+		uint32 ringBufferAddr = m_nMADR - m_dmac.m_D_RBOR;
+		uint32 ringBufferSize = m_dmac.m_D_RBSR + 0x10;
+		assert(ringBufferAddr <= ringBufferSize);
+
+		qwc = std::min<int32>(m_nQWC, (ringBufferSize - ringBufferAddr) / 0x10);
+	}
+
+	if(qwc != 0)
+	{
+		uint32 nRecv = m_receive(m_nMADR, qwc, CHCR_DIR_FROM, false);
+
+		m_nMADR += nRecv * 0x10;
+		m_nQWC -= nRecv;
+	}
+
+	if(isMfifo)
+	{
+		if(nID == DMATAG_SRC_CNT)
+		{
+			//Loop MADR if needed
+			uint32 ringBufferSize = m_dmac.m_D_RBSR + 0x10;
+			if(m_nMADR == (m_dmac.m_D_RBOR + ringBufferSize))
+			{
+				m_nMADR = m_dmac.m_D_RBOR;
+			}
+		}
+
+		//Mask TADR because it's in the ring buffer zone
+		m_nTADR -= m_dmac.m_D_RBOR;
+		m_nTADR &= m_dmac.m_D_RBSR;
+		m_nTADR += m_dmac.m_D_RBOR;
+
+		//Check MFIFO empty
+		if(m_nTADR == m_dmac.m_D8.m_nMADR)
+		{
+			m_dmac.m_D_STAT |= CDMAC::D_STAT_MEIS;
+		}
+	}
 }
 
 void CChannel::ClearSTR()

@@ -166,10 +166,11 @@ void VUShared::ClampVector(CMipsJitter* codeGen)
 	//This will transform any NaN/INF (exponent == 0xFF) into a number with exponent == 0xFE
 	//and will leave all other numbers intact
 	static const uint32 exponentMask = 0x7F800000;
+	uint32 valueToClamp = codeGen->GetTopCursor();
+	codeGen->MD_PushCstExpand(exponentMask);
 	codeGen->PushTop();
-	codeGen->MD_PushCstExpand(exponentMask);
+	codeGen->PushCursor(valueToClamp);
 	codeGen->MD_And();
-	codeGen->MD_PushCstExpand(exponentMask);
 	codeGen->MD_CmpEqW();
 	codeGen->MD_SrlW(31);
 	codeGen->MD_SllW(23);
@@ -628,7 +629,10 @@ void VUShared::ADDi(CMipsJitter* codeGen, uint8 nDest, uint8 nFd, uint8 nFs, uin
 		nFd = 32;
 	}
 
-#if 1
+	//Use FpAddTruncate on all platforms, except JavaScript
+	//On JavaScript, using it doesn't seem to help Tri-Ace games
+	//there's probably some other rounding issue on that platform
+#if !defined(__EMSCRIPTEN__)
 	for(unsigned int i = 0; i < 4; i++)
 	{
 		if(!VUShared::DestinationHasElement(nDest, i)) continue;
@@ -1016,10 +1020,13 @@ void VUShared::LQI(CMipsJitter* codeGen, uint8 dest, uint8 it, uint8 is, uint32 
 
 	VUShared::LQbase(codeGen, dest, it);
 
-	codeGen->PushRel(offsetof(CMIPS, m_State.nCOP2VI[is]));
-	codeGen->PushCst(1);
-	codeGen->Add();
-	codeGen->PullRel(offsetof(CMIPS, m_State.nCOP2VI[is]));
+	if(is != 0)
+	{
+		codeGen->PushRel(offsetof(CMIPS, m_State.nCOP2VI[is]));
+		codeGen->PushCst(1);
+		codeGen->Add();
+		codeGen->PullRel(offsetof(CMIPS, m_State.nCOP2VI[is]));
+	}
 }
 
 void VUShared::MADD(CMipsJitter* codeGen, uint8 dest, uint8 fd, uint8 fs, uint8 ft, uint32 relativePipeTime, uint32 compileHints)
@@ -1112,6 +1119,7 @@ void VUShared::MAXbc(CMipsJitter* codeGen, uint8 dest, uint8 fd, uint8 fs, uint8
 
 void VUShared::MAXi(CMipsJitter* codeGen, uint8 dest, uint8 fd, uint8 fs)
 {
+	if(fd == 0) return;
 	MAX_base(codeGen, dest,
 	         offsetof(CMIPS, m_State.nCOP2[fd]),
 	         offsetof(CMIPS, m_State.nCOP2[fs]),
@@ -1121,6 +1129,7 @@ void VUShared::MAXi(CMipsJitter* codeGen, uint8 dest, uint8 fd, uint8 fs)
 
 void VUShared::MINI(CMipsJitter* codeGen, uint8 dest, uint8 fd, uint8 fs, uint8 ft)
 {
+	if(fd == 0) return;
 	MINI_base(codeGen, dest,
 	          offsetof(CMIPS, m_State.nCOP2[fd]),
 	          offsetof(CMIPS, m_State.nCOP2[fs]),
@@ -1130,6 +1139,7 @@ void VUShared::MINI(CMipsJitter* codeGen, uint8 dest, uint8 fd, uint8 fs, uint8 
 
 void VUShared::MINIbc(CMipsJitter* codeGen, uint8 dest, uint8 fd, uint8 fs, uint8 ft, uint8 bc)
 {
+	if(fd == 0) return;
 	MINI_base(codeGen, dest,
 	          offsetof(CMIPS, m_State.nCOP2[fd]),
 	          offsetof(CMIPS, m_State.nCOP2[fs]),
@@ -1139,6 +1149,7 @@ void VUShared::MINIbc(CMipsJitter* codeGen, uint8 dest, uint8 fd, uint8 fs, uint
 
 void VUShared::MINIi(CMipsJitter* codeGen, uint8 dest, uint8 fd, uint8 fs)
 {
+	if(fd == 0) return;
 	MINI_base(codeGen, dest,
 	          offsetof(CMIPS, m_State.nCOP2[fd]),
 	          offsetof(CMIPS, m_State.nCOP2[fs]),
@@ -1541,10 +1552,13 @@ void VUShared::SQI(CMipsJitter* codeGen, uint8 dest, uint8 is, uint8 it, uint32 
 	VUShared::SQbase(codeGen, dest, is);
 
 	//Increment
-	codeGen->PushRel(offsetof(CMIPS, m_State.nCOP2VI[it]));
-	codeGen->PushCst(1);
-	codeGen->Add();
-	codeGen->PullRel(offsetof(CMIPS, m_State.nCOP2VI[it]));
+	if(it != 0)
+	{
+		codeGen->PushRel(offsetof(CMIPS, m_State.nCOP2VI[it]));
+		codeGen->PushCst(1);
+		codeGen->Add();
+		codeGen->PullRel(offsetof(CMIPS, m_State.nCOP2VI[it]));
+	}
 }
 
 void VUShared::SQRT(CMipsJitter* codeGen, uint8 nFt, uint8 nFtf, uint32 relativePipeTime)
@@ -1774,11 +1788,15 @@ void VUShared::ResetFlagPipeline(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* cod
 
 	for(uint32 i = 0; i < FLAG_PIPELINE_SLOTS; i++)
 	{
+		codeGen->PushRelAddrRef(pipeInfo.timeArray);
+		codeGen->PushCst(i * 4);
 		codeGen->PushCst(0);
-		codeGen->PullRel(pipeInfo.timeArray + (i * 4));
+		codeGen->StoreAtRefIdx();
 
+		codeGen->PushRelAddrRef(pipeInfo.valueArray);
+		codeGen->PushCst(i * 4);
 		codeGen->PushCursor(valueCursor);
-		codeGen->PullRel(pipeInfo.valueArray + (i * 4));
+		codeGen->StoreAtRefIdx();
 	}
 
 	assert(codeGen->GetTopCursor() == valueCursor);

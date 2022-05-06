@@ -29,6 +29,8 @@ namespace Iop
 		void SifBindRpc(CMIPS&);
 		void SifCallRpc(CMIPS&);
 
+		void ClearServers();
+
 	private:
 		typedef std::list<CSifDynamic*> DynamicModuleList;
 
@@ -76,12 +78,13 @@ namespace Iop
 		{
 			MAX_SYSTEM_COMMAND = 0x20,
 			MAX_SREG = 0x20,
+			TRAMPOLINE_SIZE = 0x800,
 			PENDING_CMD_BUFFER_SIZE = 0x400,
 		};
 
 		struct MODULEDATA
 		{
-			uint8 trampoline[0x800];
+			uint8 trampoline[TRAMPOLINE_SIZE];
 			uint8 sendCmdExtraStruct[0x10];
 			uint32 sreg[MAX_SREG];
 			SIFCMDDATA sysCmdBuffer[MAX_SYSTEM_COMMAND];
@@ -92,7 +95,6 @@ namespace Iop
 			uint32 pendingCmdBufferSize;
 		};
 
-		void ClearServers();
 		void BuildExportTable();
 
 		void ProcessCustomCommand(uint32);
@@ -102,6 +104,7 @@ namespace Iop
 		void ProcessNextDynamicCommand();
 
 		int32 SifGetSreg(uint32);
+		void SifSetSreg(uint32, uint32);
 		uint32 SifSetCmdBuffer(uint32, uint32);
 		void SifAddCmdHandler(uint32, uint32, uint32);
 		uint32 SifSendCmd(uint32, uint32, uint32, uint32, uint32, uint32);

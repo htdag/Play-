@@ -27,6 +27,7 @@ class QtFramedebugger;
 
 namespace Ui
 {
+	class DebugDockMenu;
 	class DebugMenu;
 }
 #endif
@@ -45,6 +46,7 @@ public:
 	void loadState(int);
 
 #ifdef DEBUGGER_INCLUDED
+	void ShowMainWindow();
 	void ShowDebugger();
 	void ShowFrameDebugger();
 	fs::path GetFrameDumpDirectoryPath();
@@ -81,17 +83,21 @@ private:
 	void EmitOnExecutableChange();
 	bool IsExecutableLoaded() const;
 	void UpdateUI();
+	void UpdateCpuUsageLabel();
 	void RegisterPreferences();
 	void saveState(int);
 	void toggleFullscreen();
 	void buildResizeWindowMenu();
 	void resizeWindow(unsigned int, unsigned int);
 	void UpdateGSHandlerLabel(int);
+	void SetupBootableView();
+	void SetupDebugger();
 
-	Ui::MainWindow* ui;
+	Ui::MainWindow* ui = nullptr;
 
 	OutputWindow* m_outputwindow = nullptr;
 	QLabel* m_fpsLabel = nullptr;
+	QLabel* m_cpuUsageLabel = nullptr;
 	QLabel* m_gsLabel = nullptr;
 #ifdef PROFILE
 	QLabel* m_profileStatsLabel = nullptr;
@@ -110,10 +116,12 @@ private:
 	Framework::CSignal<void()>::Connection m_OnExecutableChangeConnection;
 	CGSHandler::NewFrameEvent::Connection m_OnNewFrameConnection;
 	CScreenShotUtils::Connection m_screenShotCompleteConnection;
+	CVirtualMachine::RunningStateChangeEvent::Connection m_onRunningStateChangeConnection;
 
 #ifdef DEBUGGER_INCLUDED
 	std::unique_ptr<QtDebugger> m_debugger;
 	std::unique_ptr<QtFramedebugger> m_frameDebugger;
+	Ui::DebugDockMenu* debugDockMenuUi = nullptr;
 	Ui::DebugMenu* debugMenuUi = nullptr;
 #endif
 

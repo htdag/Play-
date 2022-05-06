@@ -5,24 +5,19 @@ import android.app.AlertDialog;
 import android.content.Intent;
 import android.os.Bundle;
 import android.os.Environment;
-import android.util.Log;
-import android.view.ContextThemeWrapper;
-
-import java.io.File;
 
 public class ExternalEmulatorLauncher extends Activity
 {
-	public ExternalEmulatorLauncher()
-	{
-	}
-
 	@Override
 	public void onCreate(Bundle savedInstanceState)
 	{
 		super.onCreate(savedInstanceState);
 		// TODO: This method is called when the BroadcastReceiver is receiving
 		// an Intent broadcast.
-		NativeInterop.setFilesDirPath(Environment.getExternalStorageDirectory().getAbsolutePath());
+		NativeInterop.setFilesDirPath(getApplicationContext().getFilesDir().getAbsolutePath());
+		NativeInterop.setCacheDirPath(getApplicationContext().getCacheDir().getAbsolutePath());
+		NativeInterop.setAssetManager(getAssets());
+		NativeInterop.setContentResolver(getApplicationContext().getContentResolver());
 
 		EmulatorActivity.RegisterPreferences();
 
@@ -37,21 +32,21 @@ public class ExternalEmulatorLauncher extends Activity
 			{
 				try
 				{
-					VirtualMachineManager.launchDisk(this, new File(intent.getData().getPath()));
+					VirtualMachineManager.launchGame(this, intent.getData().getPath());
 					finish();
 				}
 				catch(Exception e)
 				{
-					displaySimpleMessage("Error", e.getMessage());
+					displaySimpleMessage(e.getMessage());
 				}
 			}
 		}
 	}
 
-	private void displaySimpleMessage(String title, String message)
+	private void displaySimpleMessage(String message)
 	{
 		new AlertDialog.Builder(this)
-				.setTitle(title)
+				.setTitle("Error")
 				.setMessage(message)
 				.setPositiveButton(android.R.string.ok, (dialog, id) ->
 						finish()

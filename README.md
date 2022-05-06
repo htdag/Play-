@@ -1,10 +1,31 @@
 # Play! #
-Play! is a PlayStation 2 emulator for Windows, macOS, UNIX, Android & iOS platforms.
+Play! is a PlayStation2 emulator for Windows, macOS, UNIX, Android, iOS & web browser platforms.
 
 Compatibility information is available on the official [Compatibility Tracker](https://github.com/jpd002/Play-Compatibility).
 If a specific game doesn't work with the emulator, please create a new issue there.
 
 For more information, please visit [purei.org](https://purei.org).
+
+You can try the experimental web browser version here: [playjs.purei.org](https://playjs.purei.org).
+
+For general discussion, you're welcome to join our Discord: https://discord.gg/HygQnQP.
+
+## Running on iOS ##
+
+This emulator uses JIT code generation to speed things up. This is not supported by default by iOS, thus, there are some extra requirements:
+
+- Have a device running iOS 13 or less, or an arm64e device running iOS 14.2/14.3.
+- Have a jailbroken device.
+
+If these requirements are not met, there are still ways to enable JIT through other means. Here is a guide explaining how JIT can be enabled:
+
+https://spidy123222.github.io/iOS-Debugging-JIT-Guides/
+
+Play! implements automatic JIT activation through AltServer, which requires AltServer to be running on the same network as your iOS device. This can be enabled in the Settings menu of the emulator.
+
+You can also build the emulator yourself and launch it through Xcode's debugger, but you will need to be tethered to your Mac while playing. You will also need a paid developer license to do that.
+
+**If you try to play a game without JIT enabled, you will experience a crash when you launch the game.**
 
 ## Building ##
 
@@ -47,7 +68,7 @@ There are two ways to generate a build for macOS. Either by using Makefiles, or 
  ```
  ```
  # Not specifying -G will automatically pick Makefiles
- cmake .. -G Xcode -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=~/Qt/5.1.0/clang_64/
+ cmake .. -G Xcode -DCMAKE_PREFIX_PATH=~/Qt/5.1.0/clang_64/
  cmake --build . --config Release
  # OR
  cmake .. -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=~/Qt/5.1.0/clang_64/
@@ -66,6 +87,17 @@ Example:
  ```
 
 Note: iOS builds generated with Makefiles will not be FAT binaries.
+
+To test your iOS builds on a device, you will need to setup code signing:
+- Set `CODE_SIGNING_ALLOWED` to `YES` on the `Play` target.
+- Set your code signing parameters in Signing & Capabilities tab in Xcode.
+
+To build with Vulkan on macOS, just make sure the `$VULKAN_SDK` environment variable is set with the proper path.
+
+On iOS, you will need to add this to your CMake command line:
+ ```bash
+ -DCMAKE_PREFIX_PATH=$VULKAN_SDK
+ ```
 
 ### Building for UNIX ###
 if you don't have Cmake or OpenAL lib installed, you'll also require Qt. (preferably version 5.6)
@@ -133,19 +165,57 @@ Once this is done, you can start the build:
 ##### About Release/Signed builds #####
 Building through Android Studio, you have the option to “Generate Signed APK”.
 
-When building through Gradle, you must create a text file called `Play/build_android/keystore.properties` and add the following properties to it: `storeFile`, `storePassword`, `keyAlias`, and `keyPassword`.
+When building through Gradle, make sure these variables are defined in a `gradle.properties` file, either in your project directory or in your `GRADLE_USER_HOME` directory:
 
-E.g for `keystore.properties`:
  ```
- storeFile=/location/to/my/key.jks
- storePassword=mysuperhardpassword
- keyAlias=myalias
- keyPassword=myevenharderpassword
+ PLAY_RELEASE_STORE_FILE=/location/to/my/key.jks
+ PLAY_RELEASE_STORE_PASSWORD=mysuperhardpassword
+ PLAY_RELEASE_KEY_ALIAS=myalias
+ PLAY_RELEASE_KEY_PASSWORD=myevenharderpassword
  ```
-Please leave an empty new line at the end of the file.
+
+Then, you should be able to use `assembleRelease` to generate a signed release build.
  ```
  cd Play/build_android
  sh gradlew assembleRelease
  # or on Windows
  gradlew.bat assembleRelease
  ```
+
+### Building for Web Browsers ###
+
+Building for the web browser environment requires [emscripten](https://emscripten.org/).
+
+Use `emcmake` to generate the project:
+
+```
+mkdir build
+cd build
+emcmake cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DBUILD_PLAY=ON -DBUILD_PSFPLAYER=ON -DUSE_QT=OFF
+```
+
+Upon completion, you can build the JavaScript/WebAssembly files using this command line:
+
+```
+cmake --build . --config Release
+```
+
+This will generate the JavaScript glue code and the WebAssembly module required for the web application located in `js/play_browser`. Here's where the output files from emscripten need to be copied:
+
+```
+build_cmake/build/Source/ui_js/Play.js -> js/play_browser/src/Play.js
+build_cmake/build/Source/ui_js/Play.wasm -> js/play_browser/public/Play.wasm
+build_cmake/build/Source/ui_js/Play.js -> js/play_browser/public/Play.js
+build_cmake/build/Source/ui_js/Play.worker.js -> js/play_browser/public/Play.worker.js
+```
+
+Once this is done, you should be able to go in the `js/play_browser` folder and run the following to get a local version running in your web browser:
+
+```
+npm install
+npm start
+```
+
+##### Browser environment caveats #####
+- Write protection on memory pages is not supported, thus, games loading modules on the EE might not work properly since JIT cache can't be invalidated.
+- No control over floating point environment, default rounding mode is used, which can cause issues in some games.

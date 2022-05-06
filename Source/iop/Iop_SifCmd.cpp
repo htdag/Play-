@@ -1,6 +1,8 @@
 #include <cstring>
 #include "Iop_SifCmd.h"
 #include "IopBios.h"
+#include "../Ps2Const.h"
+#include "../COP_SCU.h"
 #include "../ee/SIF.h"
 #include "../Log.h"
 #include "../states/StructCollectionStateFile.h"
@@ -22,6 +24,7 @@ using namespace Iop;
 #define MODULE_VERSION 0x101
 
 #define FUNCTION_SIFGETSREG "SifGetSreg"
+#define FUNCTION_SIFSETSREG "SifSetSreg"
 #define FUNCTION_SIFSETCMDBUFFER "SifSetCmdBuffer"
 #define FUNCTION_SIFADDCMDHANDLER "SifAddCmdHandler"
 #define FUNCTION_SIFSENDCMD "SifSendCmd"
@@ -119,6 +122,9 @@ std::string CSifCmd::GetFunctionName(unsigned int functionId) const
 	case 6:
 		return FUNCTION_SIFGETSREG;
 		break;
+	case 7:
+		return FUNCTION_SIFSETSREG;
+		break;
 	case 8:
 		return FUNCTION_SIFSETCMDBUFFER;
 		break;
@@ -201,6 +207,11 @@ void CSifCmd::Invoke(CMIPS& context, unsigned int functionId)
 	case 6:
 		context.m_State.nGPR[CMIPS::V0].nV0 = SifGetSreg(
 		    context.m_State.nGPR[CMIPS::A0].nV0);
+		break;
+	case 7:
+		SifSetSreg(
+		    context.m_State.nGPR[CMIPS::A0].nV0,
+		    context.m_State.nGPR[CMIPS::A1].nV0);
 		break;
 	case 8:
 		context.m_State.nGPR[CMIPS::V0].nV0 = SifSetCmdBuffer(
@@ -331,34 +342,35 @@ void CSifCmd::BuildExportTable()
 
 	{
 		CMIPSAssembler assembler(exportTable);
+		uint32 assemblerBaseAddress = static_cast<uint32>(reinterpret_cast<uint8*>(exportTable) - m_ram);
 
 		//Trampoline for SifGetNextRequest
-		uint32 sifGetNextRequestAddr = (reinterpret_cast<uint8*>(exportTable) - m_ram) + (assembler.GetProgramSize() * 4);
+		uint32 sifGetNextRequestAddr = assemblerBaseAddress + (assembler.GetProgramSize() * 4);
 		assembler.JR(CMIPS::RA);
 		assembler.ADDIU(CMIPS::R0, CMIPS::R0, 20);
 
 		//Trampoline for SifExecRequest
-		uint32 sifExecRequestAddr = (reinterpret_cast<uint8*>(exportTable) - m_ram) + (assembler.GetProgramSize() * 4);
+		uint32 sifExecRequestAddr = assemblerBaseAddress + (assembler.GetProgramSize() * 4);
 		assembler.JR(CMIPS::RA);
 		assembler.ADDIU(CMIPS::R0, CMIPS::R0, 21);
 
-		uint32 finishExecRequestAddr = (reinterpret_cast<uint8*>(exportTable) - m_ram) + (assembler.GetProgramSize() * 4);
+		uint32 finishExecRequestAddr = assemblerBaseAddress + (assembler.GetProgramSize() * 4);
 		assembler.JR(CMIPS::RA);
 		assembler.ADDIU(CMIPS::R0, CMIPS::R0, CUSTOM_FINISHEXECREQUEST);
 
-		uint32 finishExecCmdAddr = (reinterpret_cast<uint8*>(exportTable) - m_ram) + (assembler.GetProgramSize() * 4);
+		uint32 finishExecCmdAddr = assemblerBaseAddress + (assembler.GetProgramSize() * 4);
 		assembler.JR(CMIPS::RA);
 		assembler.ADDIU(CMIPS::R0, CMIPS::R0, CUSTOM_FINISHEXECCMD);
 
-		uint32 finishBindRpcAddr = (reinterpret_cast<uint8*>(exportTable) - m_ram) + (assembler.GetProgramSize() * 4);
+		uint32 finishBindRpcAddr = assemblerBaseAddress + (assembler.GetProgramSize() * 4);
 		assembler.JR(CMIPS::RA);
 		assembler.ADDIU(CMIPS::R0, CMIPS::R0, CUSTOM_FINISHBINDRPC);
 
-		uint32 sleepThreadAddr = (reinterpret_cast<uint8*>(exportTable) - m_ram) + (assembler.GetProgramSize() * 4);
+		uint32 sleepThreadAddr = assemblerBaseAddress + (assembler.GetProgramSize() * 4);
 		assembler.JR(CMIPS::RA);
 		assembler.ADDIU(CMIPS::R0, CMIPS::R0, CUSTOM_SLEEPTHREAD);
 
-		uint32 delayThreadAddr = (reinterpret_cast<uint8*>(exportTable) - m_ram) + (assembler.GetProgramSize() * 4);
+		uint32 delayThreadAddr = assemblerBaseAddress + (assembler.GetProgramSize() * 4);
 		assembler.JR(CMIPS::RA);
 		assembler.ADDIU(CMIPS::R0, CMIPS::R0, CUSTOM_DELAYTHREAD);
 
@@ -366,7 +378,7 @@ void CSifCmd::BuildExportTable()
 		{
 			static const int16 stackAlloc = 0x10;
 
-			m_sifRpcLoopAddr = (reinterpret_cast<uint8*>(exportTable) - m_ram) + (assembler.GetProgramSize() * 4);
+			m_sifRpcLoopAddr = assemblerBaseAddress + (assembler.GetProgramSize() * 4);
 			auto checkNextRequestLabel = assembler.CreateLabel();
 			auto sleepThreadLabel = assembler.CreateLabel();
 
@@ -402,7 +414,7 @@ void CSifCmd::BuildExportTable()
 		{
 			static const int16 stackAlloc = 0x20;
 
-			m_sifExecRequestAddr = (reinterpret_cast<uint8*>(exportTable) - m_ram) + (assembler.GetProgramSize() * 4);
+			m_sifExecRequestAddr = assemblerBaseAddress + (assembler.GetProgramSize() * 4);
 
 			assembler.ADDIU(CMIPS::SP, CMIPS::SP, -stackAlloc);
 			assembler.SW(CMIPS::RA, 0x1C, CMIPS::SP);
@@ -430,18 +442,30 @@ void CSifCmd::BuildExportTable()
 		{
 			static const int16 stackAlloc = 0x20;
 
-			m_sifExecCmdHandlerAddr = (reinterpret_cast<uint8*>(exportTable) - m_ram) + (assembler.GetProgramSize() * 4);
+			m_sifExecCmdHandlerAddr = assemblerBaseAddress + (assembler.GetProgramSize() * 4);
 
 			assembler.ADDIU(CMIPS::SP, CMIPS::SP, -stackAlloc);
 			assembler.SW(CMIPS::RA, 0x1C, CMIPS::SP);
 			assembler.SW(CMIPS::S0, 0x18, CMIPS::SP);
 			assembler.ADDU(CMIPS::S0, CMIPS::A0, CMIPS::R0);
 
+			//Disable interrupts as the handler is supposed to be called in an interrupt handler
+			assembler.MFC0(CMIPS::T0, CCOP_SCU::STATUS);
+			assembler.LI(CMIPS::T1, ~CMIPS::STATUS_IE);
+			assembler.AND(CMIPS::T0, CMIPS::T0, CMIPS::T1);
+			assembler.MTC0(CMIPS::T0, CCOP_SCU::STATUS);
+
 			assembler.ADDU(CMIPS::A0, CMIPS::A1, CMIPS::R0); //A0 = Packet Address
 			assembler.LW(CMIPS::A1, offsetof(SIFCMDDATA, data), CMIPS::S0);
 			assembler.LW(CMIPS::T0, offsetof(SIFCMDDATA, sifCmdHandler), CMIPS::S0);
 			assembler.JALR(CMIPS::T0);
 			assembler.NOP();
+
+			//Enable interrupts
+			assembler.MFC0(CMIPS::T0, CCOP_SCU::STATUS);
+			assembler.LI(CMIPS::T1, CMIPS::STATUS_IE);
+			assembler.OR(CMIPS::T0, CMIPS::T0, CMIPS::T1);
+			assembler.MTC0(CMIPS::T0, CCOP_SCU::STATUS);
 
 			assembler.JAL(finishExecCmdAddr);
 			assembler.NOP();
@@ -456,7 +480,7 @@ void CSifCmd::BuildExportTable()
 		{
 			static const int16 stackAlloc = 0x20;
 
-			m_sifBindRpcAddr = (reinterpret_cast<uint8*>(exportTable) - m_ram) + (assembler.GetProgramSize() * 4);
+			m_sifBindRpcAddr = assemblerBaseAddress + (assembler.GetProgramSize() * 4);
 
 			assembler.ADDIU(CMIPS::SP, CMIPS::SP, -stackAlloc);
 			assembler.SW(CMIPS::RA, 0x1C, CMIPS::SP);
@@ -482,6 +506,9 @@ void CSifCmd::BuildExportTable()
 			assembler.JR(CMIPS::RA);
 			assembler.ADDIU(CMIPS::SP, CMIPS::SP, stackAlloc);
 		}
+
+		uint32 totalSize = (assembler.GetProgramSize() * 4);
+		assert(totalSize <= TRAMPOLINE_SIZE);
 	}
 }
 
@@ -493,7 +520,12 @@ void CSifCmd::ProcessInvocation(uint32 serverDataAddr, uint32 methodId, uint32* 
 	//Copy params
 	if(serverData->buffer != 0)
 	{
-		memcpy(&m_ram[serverData->buffer], params, size);
+		//SIF DMA only deals with quadwords, round the transfer size up to quadword boundary
+		//Atelier Marie & Elie relies on this: reports payload of size 0x1C, but actually uses 0x20
+		//Module init funciton reads at 0x1C to get a pointer to EE memory used to update sound status
+		uint32 copySize = (size + 0x0F) & ~0x0F;
+		uint32 bufferAddr = serverData->buffer & (PS2::EE_RAM_SIZE - 1);
+		memcpy(&m_ram[bufferAddr], params, copySize);
 	}
 	serverData->rid = methodId;
 	serverData->rsize = size;
@@ -540,7 +572,7 @@ void CSifCmd::FinishBindRpc(uint32 clientDataAddr, uint32 serverId)
 {
 	auto clientData = reinterpret_cast<SIFRPCCLIENTDATA*>(m_ram + clientDataAddr);
 	clientData->serverDataAddr = serverId;
-	clientData->header.semaId = m_bios.CreateSemaphore(0, 1);
+	clientData->header.semaId = m_bios.CreateSemaphore(0, 1, 0, 0);
 
 	int32 result = CIopBios::KERNEL_RESULT_OK;
 	result = m_bios.WaitSemaphore(clientData->header.semaId);
@@ -698,6 +730,19 @@ int32 CSifCmd::SifGetSreg(uint32 regIndex)
 	return result;
 }
 
+void CSifCmd::SifSetSreg(uint32 regIndex, uint32 value)
+{
+	CLog::GetInstance().Print(LOG_NAME, FUNCTION_SIFSETSREG "(regIndex = %d, value = 0x%08X);\r\n",
+	                          regIndex, value);
+	assert(regIndex < MAX_SREG);
+	if(regIndex >= MAX_SREG)
+	{
+		return;
+	}
+	auto moduleData = reinterpret_cast<MODULEDATA*>(m_ram + m_moduleDataAddr);
+	moduleData->sreg[regIndex] = value;
+}
+
 uint32 CSifCmd::SifSetCmdBuffer(uint32 cmdBufferAddr, uint32 length)
 {
 	CLog::GetInstance().Print(LOG_NAME, FUNCTION_SIFSETCMDBUFFER "(cmdBufferAddr = 0x%08X, length = %d);\r\n",
@@ -804,7 +849,7 @@ void CSifCmd::SifCallRpc(CMIPS& context)
 	assert(clientData->serverDataAddr != 0);
 	clientData->endFctPtr = endFctAddr;
 	clientData->endParam = endParam;
-	clientData->header.semaId = m_bios.CreateSemaphore(0, 1);
+	clientData->header.semaId = m_bios.CreateSemaphore(0, 1, 0, 0);
 	int32 result = CIopBios::KERNEL_RESULT_OK;
 	result = m_bios.WaitSemaphore(clientData->header.semaId);
 	assert(result == CIopBios::KERNEL_RESULT_OK);

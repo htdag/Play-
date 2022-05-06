@@ -81,6 +81,7 @@ void CVif::Reset()
 	m_stream.Reset();
 	m_pendingMicroProgram = -1;
 	m_incomingFifoDelay = 0;
+	m_interruptDelayTicks = 0;
 }
 
 uint32 CVif::GetRegister(uint32 address)
@@ -90,6 +91,18 @@ uint32 CVif::GetRegister(uint32 address)
 	{
 	case VIF0_STAT:
 	case VIF1_STAT:
+		if((m_STAT.nVEW != 0) && (m_CODE.nCMD == CODE_CMD_FLUSHE))
+		{
+			//We have a pending FLUSHE command that's waiting for the microprogram's end.
+			//Check if it's finished and act as if the command was executed properly.
+			//Some games will keep reading this register in a loop to verify the state of the VEW bit.
+			//- Red Faction
+			//- RPG Maker 3
+			if(!m_vpu.IsVuRunning())
+			{
+				m_STAT.nVEW = 0;
+			}
+		}
 		result = m_STAT;
 		if(m_STAT.nFDR != 0)
 		{
@@ -106,6 +119,14 @@ uint32 CVif::GetRegister(uint32 address)
 			{
 				m_incomingFifoDelay--;
 			}
+		}
+		if(m_STAT.nVIS)
+		{
+			//If we're not idle here, something might be wrong
+			assert(m_STAT.nVPS == STAT_VPS_IDLE);
+			//If we're stalled because of an interrupt, report that VIF is decoding
+			result &= ~STAT_VPS_MASK;
+			result |= STAT_VPS_DECODING;
 		}
 		break;
 	case VIF0_ERR:
@@ -223,6 +244,20 @@ void CVif::SetRegister(uint32 address, uint32 value)
 #ifdef _DEBUG
 	DisassembleSet(address, value);
 #endif
+}
+
+void CVif::CountTicks(uint32 ticks)
+{
+	if(m_interruptDelayTicks != 0)
+	{
+		m_interruptDelayTicks -= ticks;
+		if(m_interruptDelayTicks <= 0)
+		{
+			assert(m_STAT.nINT);
+			m_intc.AssertLine(CINTC::INTC_LINE_VIF0 + m_number);
+			m_interruptDelayTicks = 0;
+		}
+	}
 }
 
 void CVif::SaveState(Framework::CZipArchiveWriter& archive)
@@ -401,10 +436,22 @@ void CVif::ProcessPacket(StreamType& stream)
 				m_STAT.nVIS = 1;
 			}
 			m_STAT.nINT = 1;
-			m_intc.AssertLine(CINTC::INTC_LINE_VIF0 + m_number);
+			m_interruptDelayTicks = 0x1000;
 		}
 
-		m_NUM = m_CODE.nNUM;
+		switch(m_CODE.nCMD)
+		{
+		case CODE_CMD_STMASK:
+			m_NUM = 1;
+			break;
+		case CODE_CMD_STROW:
+		case CODE_CMD_STCOL:
+			m_NUM = 4;
+			break;
+		default:
+			m_NUM = m_CODE.nNUM;
+			break;
+		}
 
 		ExecuteCommand(stream, m_CODE);
 	}
@@ -454,8 +501,7 @@ void CVif::ExecuteCommand(StreamType& stream, CODE nCommand)
 		m_MARK = nCommand.nIMM;
 		m_STAT.nMRK = 1;
 		break;
-	case 0x10:
-		//FLUSHE
+	case CODE_CMD_FLUSHE:
 		if(m_vpu.IsVuRunning())
 		{
 			m_STAT.nVEW = 1;
@@ -498,16 +544,13 @@ void CVif::ExecuteCommand(StreamType& stream, CODE nCommand)
 		}
 		StartMicroProgram(m_vpu.GetContext().m_State.nPC);
 		break;
-	case 0x20:
-		//STMASK
+	case CODE_CMD_STMASK:
 		Cmd_STMASK(stream, nCommand);
 		break;
-	case 0x30:
-		//STROW
+	case CODE_CMD_STROW:
 		Cmd_STROW(stream, nCommand);
 		break;
-	case 0x31:
-		//STCOL
+	case CODE_CMD_STCOL:
 		Cmd_STCOL(stream, nCommand);
 		break;
 	case 0x4A:
@@ -593,11 +636,6 @@ void CVif::Cmd_MPG(StreamType& stream, CODE nCommand)
 
 void CVif::Cmd_STROW(StreamType& stream, CODE nCommand)
 {
-	if(m_NUM == 0)
-	{
-		m_NUM = 4;
-	}
-
 	while(m_NUM != 0 && stream.GetAvailableReadBytes())
 	{
 		assert(m_NUM <= 4);
@@ -617,11 +655,6 @@ void CVif::Cmd_STROW(StreamType& stream, CODE nCommand)
 
 void CVif::Cmd_STCOL(StreamType& stream, CODE nCommand)
 {
-	if(m_NUM == 0)
-	{
-		m_NUM = 4;
-	}
-
 	while(m_NUM != 0 && stream.GetAvailableReadBytes())
 	{
 		assert(m_NUM <= 4);
@@ -641,11 +674,6 @@ void CVif::Cmd_STCOL(StreamType& stream, CODE nCommand)
 
 void CVif::Cmd_STMASK(StreamType& stream, CODE command)
 {
-	if(m_NUM == 0)
-	{
-		m_NUM = 1;
-	}
-
 	while(m_NUM != 0 && stream.GetAvailableReadBytes())
 	{
 		stream.Read(&m_MASK, 4);
@@ -943,10 +971,10 @@ void CVif::DisassembleCommand(CODE code)
 		case 0x06:
 			CLog::GetInstance().Print(LOG_NAME, "MSKPATH3(mask = %d);\r\n", (code.nIMM & 0x8000) ? 1 : 0);
 			break;
-		case 0x07:
+		case CODE_CMD_MARK:
 			CLog::GetInstance().Print(LOG_NAME, "MARK(imm = 0x%x);\r\n", code.nIMM);
 			break;
-		case 0x10:
+		case CODE_CMD_FLUSHE:
 			CLog::GetInstance().Print(LOG_NAME, "FLUSHE();\r\n");
 			break;
 		case 0x11:
@@ -964,13 +992,13 @@ void CVif::DisassembleCommand(CODE code)
 		case 0x17:
 			CLog::GetInstance().Print(LOG_NAME, "MSCNT();\r\n");
 			break;
-		case 0x20:
+		case CODE_CMD_STMASK:
 			CLog::GetInstance().Print(LOG_NAME, "STMASK();\r\n");
 			break;
-		case 0x30:
+		case CODE_CMD_STROW:
 			CLog::GetInstance().Print(LOG_NAME, "STROW();\r\n");
 			break;
-		case 0x31:
+		case CODE_CMD_STCOL:
 			CLog::GetInstance().Print(LOG_NAME, "STCOL();\r\n");
 			break;
 		case 0x4A:

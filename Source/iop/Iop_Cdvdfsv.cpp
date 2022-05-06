@@ -245,10 +245,15 @@ bool CCdvdfsv::Invoke593(uint32 method, uint32* args, uint32 argsSize, uint32* r
 	case 0x27:
 	{
 		//ReadDvdDualInfo
-		assert(retSize >= 8);
+		assert(retSize >= 0x08);
 		CLog::GetInstance().Print(LOG_NAME, "ReadDvdDualInfo();\r\n");
 		ret[0] = 1;
 		ret[1] = (m_opticalMedia && m_opticalMedia->GetDvdIsDualLayer()) ? 1 : 0;
+		//Some games (Xenosaga) have a different version of this call which returns only 8 bytes
+		if(retSize >= 0x0C)
+		{
+			ret[2] = m_opticalMedia ? m_opticalMedia->GetDvdSecondLayerStart() : 0;
+		}
 	}
 	break;
 
@@ -298,6 +303,10 @@ bool CCdvdfsv::Invoke595(uint32 method, uint32* args, uint32 argsSize, uint32* r
 
 	case 0x0E:
 		return NDiskReady(args, argsSize, ret, retSize, ram);
+		break;
+
+	case 0x0F:
+		ReadChain(args, argsSize, ret, retSize, ram);
 		break;
 
 	default:
@@ -488,6 +497,35 @@ bool CCdvdfsv::NDiskReady(uint32* args, uint32 argsSize, uint32* ret, uint32 ret
 		m_pendingCommand = COMMAND_NDISKREADY;
 		ret[0x00] = 2;
 		return false;
+	}
+}
+
+void CCdvdfsv::ReadChain(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, uint8* ram)
+{
+	assert(argsSize >= 788);
+	assert(retSize == 0);
+
+	CLog::GetInstance().Print(LOG_NAME, "ReadChain(...);\r\n");
+
+	auto fileSystem = m_opticalMedia->GetFileSystem();
+	static const uint32 sectorSize = 0x800;
+
+	static const uint32 maxTupleCount = 64;
+	for(uint32 tuple = 0; tuple < maxTupleCount; tuple++)
+	{
+		uint32 tupleBase = (tuple * 3);
+		uint32 sectorPos = args[tupleBase + 0];
+		uint32 sectorCount = args[tupleBase + 1];
+		uint32 dstAddress = args[tupleBase + 2];
+		if((sectorPos == ~0U) || (sectorCount == ~0U) || (dstAddress == ~0U))
+		{
+			break;
+		}
+		assert((dstAddress & 1) == 0);
+		for(unsigned int sector = 0; sector < sectorCount; sector++)
+		{
+			fileSystem->ReadBlock(sectorPos + sector, ram + (dstAddress + (sector * sectorSize)));
+		}
 	}
 }
 

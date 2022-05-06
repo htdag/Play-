@@ -32,9 +32,9 @@ CSubSystem::CSubSystem(bool ps2Mode)
     , m_sio2(m_intc)
 #endif
     , m_speed(m_intc)
+    , m_ilink(m_intc)
     , m_cpuArch(MIPS_REGSIZE_32)
     , m_copScu(MIPS_REGSIZE_32)
-    , m_dmaUpdateTicks(0)
 {
 	if(ps2Mode)
 	{
@@ -115,6 +115,7 @@ void CSubSystem::SaveState(Framework::CZipArchiveWriter& archive)
 	m_counters.SaveState(archive);
 	m_spuCore0.SaveState(archive);
 	m_spuCore1.SaveState(archive);
+	m_ilink.SaveState(archive);
 #ifdef _IOP_EMULATE_MODULES
 	m_sio2.SaveState(archive);
 #endif
@@ -132,6 +133,7 @@ void CSubSystem::LoadState(Framework::CZipArchiveReader& archive)
 	m_counters.LoadState(archive);
 	m_spuCore0.LoadState(archive);
 	m_spuCore1.LoadState(archive);
+	m_ilink.LoadState(archive);
 #ifdef _IOP_EMULATE_MODULES
 	m_sio2.LoadState(archive);
 #endif
@@ -154,6 +156,7 @@ void CSubSystem::Reset()
 	m_sio2.Reset();
 #endif
 	m_speed.Reset();
+	m_ilink.Reset();
 	m_counters.Reset();
 	m_dmac.Reset();
 	m_intc.Reset();
@@ -162,6 +165,7 @@ void CSubSystem::Reset()
 	m_cpu.m_Functions.RemoveTags();
 
 	m_dmaUpdateTicks = 0;
+	m_spuIrqUpdateTicks = 0;
 }
 
 void CSubSystem::SetupPageTable()
@@ -228,10 +232,9 @@ uint32 CSubSystem::ReadIoRegister(uint32 address)
 	{
 		return m_speed.ReadRegister(address);
 	}
-	else if(address >= 0x1F808400 && address <= 0x1F808500)
+	else if(address >= CIlink::ADDR_BEGIN && address <= CIlink::ADDR_END)
 	{
-		//iLink (aka Firewire) stuff
-		return 0x08;
+		return m_ilink.ReadRegister(address);
 	}
 	else
 	{
@@ -284,6 +287,10 @@ uint32 CSubSystem::WriteIoRegister(uint32 address, uint32 value)
 	else if(address >= SPEED_REG_BEGIN && address <= SPEED_REG_END)
 	{
 		m_speed.WriteRegister(address, value);
+	}
+	else if(address >= CIlink::ADDR_BEGIN && address <= CIlink::ADDR_END)
+	{
+		m_ilink.WriteRegister(address, value);
 	}
 	else
 	{

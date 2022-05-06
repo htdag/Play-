@@ -12,10 +12,11 @@
 #include "GSH_VulkanTransferLocal.h"
 #include <vector>
 #include "../GSHandler.h"
+#include "../GsDebuggerInterface.h"
 #include "../GsCachedArea.h"
 #include "../GsTextureCache.h"
 
-class CGSH_Vulkan : public CGSHandler
+class CGSH_Vulkan : public CGSHandler, public CGsDebuggerInterface
 {
 public:
 	CGSH_Vulkan();
@@ -29,11 +30,26 @@ public:
 	void ProcessLocalToHostTransfer() override;
 	void ProcessLocalToLocalTransfer() override;
 	void ProcessClutTransfer(uint32, uint32) override;
-	void ReadFramebuffer(uint32, uint32, void*) override;
 
 	uint8* GetRam() const override;
 
 	Framework::CBitmap GetScreenshot() override;
+
+	//Debugger Interface
+	bool GetDepthTestingEnabled() const override;
+	void SetDepthTestingEnabled(bool) override;
+
+	bool GetAlphaBlendingEnabled() const override;
+	void SetAlphaBlendingEnabled(bool) override;
+
+	bool GetAlphaTestingEnabled() const override;
+	void SetAlphaTestingEnabled(bool) override;
+
+	Framework::CBitmap GetFramebuffer(uint64) override;
+	Framework::CBitmap GetTexture(uint64, uint32, uint64, uint64, uint32) override;
+	int GetFramebufferScale() override;
+
+	const VERTEX* GetInputVertices() const override;
 
 protected:
 	void WriteRegisterImpl(uint8, uint64) override;
@@ -52,15 +68,6 @@ protected:
 	GSH_Vulkan::ContextPtr m_context;
 
 private:
-	struct VERTEX
-	{
-		uint64 position;
-		uint64 rgbaq;
-		uint64 uv;
-		uint64 st;
-		uint8 fog;
-	};
-
 	struct CLUTKEY : public convertible<uint64>
 	{
 		uint32 idx4 : 1;
@@ -95,12 +102,78 @@ private:
 	void VertexKick(uint8, uint64);
 	void SetRenderingContext(uint64);
 
+	void Prim_Point();
 	void Prim_Line();
 	void Prim_Triangle();
 	void Prim_Sprite();
 
 	int32 FindCachedClut(const CLUTKEY&) const;
 	static CLUTKEY MakeCachedClutKey(const TEX0&, const TEXCLUT&);
+
+	Framework::CBitmap GetFramebufferImpl(uint64);
+	Framework::CBitmap GetTextureImpl(uint64, uint32, uint64, uint64, uint32);
+
+	template <typename PixelIndexor, uint32 mask = ~0U>
+	static Framework::CBitmap ReadImage32(uint8* ram, uint32 bufferPtr, uint32 bufferWidth, uint32 width, uint32 height)
+	{
+		auto bitmap = Framework::CBitmap(width, height, 32);
+		auto bitmapPixels = reinterpret_cast<uint32*>(bitmap.GetPixels());
+		PixelIndexor indexor(ram, bufferPtr, bufferWidth);
+		for(unsigned int y = 0; y < height; y++)
+		{
+			for(unsigned int x = 0; x < width; x++)
+			{
+				uint32 pixel = indexor.GetPixel(x, y) & mask;
+				uint32 r = (pixel & 0x000000FF) >> 0;
+				uint32 g = (pixel & 0x0000FF00) >> 8;
+				uint32 b = (pixel & 0x00FF0000) >> 16;
+				uint32 a = (pixel & 0xFF000000) >> 24;
+				(*bitmapPixels) = b | (g << 8) | (r << 16) | (a << 24);
+				bitmapPixels++;
+			}
+		}
+		return bitmap;
+	}
+
+	template <typename PixelIndexor>
+	static Framework::CBitmap ReadImage16(uint8* ram, uint32 bufferPtr, uint32 bufferWidth, uint32 width, uint32 height)
+	{
+		auto bitmap = Framework::CBitmap(width, height, 32);
+		auto bitmapPixels = reinterpret_cast<uint32*>(bitmap.GetPixels());
+		PixelIndexor indexor(ram, bufferPtr, bufferWidth);
+		for(unsigned int y = 0; y < height; y++)
+		{
+			for(unsigned int x = 0; x < width; x++)
+			{
+				uint16 pixel = indexor.GetPixel(x, y);
+				uint32 r = ((pixel & 0x001F) >> 0) << 3;
+				uint32 g = ((pixel & 0x03E0) >> 5) << 3;
+				uint32 b = ((pixel & 0x7C00) >> 10) << 3;
+				uint32 a = (((pixel & 0x8000) >> 15) != 0) ? 0xFF : 0;
+				(*bitmapPixels) = b | (g << 8) | (r << 16) | (a << 24);
+				bitmapPixels++;
+			}
+		}
+		return bitmap;
+	}
+
+	template <typename PixelIndexor>
+	static Framework::CBitmap ReadImage8(uint8* ram, uint32 bufferPtr, uint32 bufferWidth, uint32 width, uint32 height)
+	{
+		auto bitmap = Framework::CBitmap(width, height, 8);
+		auto bitmapPixels = reinterpret_cast<uint8*>(bitmap.GetPixels());
+		PixelIndexor indexor(ram, bufferPtr, bufferWidth);
+		for(unsigned int y = 0; y < height; y++)
+		{
+			for(unsigned int x = 0; x < width; x++)
+			{
+				uint8 pixel = indexor.GetPixel(x, y);
+				(*bitmapPixels) = pixel;
+				bitmapPixels++;
+			}
+		}
+		return bitmap;
+	}
 
 	GSH_Vulkan::FrameCommandBufferPtr m_frameCommandBuffer;
 	GSH_Vulkan::ClutLoadPtr m_clutLoad;
@@ -123,6 +196,16 @@ private:
 	CLUTKEY m_clutStates[CLUT_CACHE_SIZE];
 	uint32 m_nextClutCacheIndex = 0;
 	std::vector<uint8> m_xferBuffer;
+
+	//Optimization for Virtua Fighter 2, Sega Rally 95
+	float m_lastLineU = 0;
+	float m_lastLineV = 0;
+	float m_clutLineU = 0;
+	float m_clutLineV = 0;
+
+	bool m_depthTestingEnabled = true;
+	bool m_alphaBlendingEnabled = true;
+	bool m_alphaTestingEnabled = true;
 
 	Framework::Vulkan::CImage m_swizzleTablePSMCT32;
 	Framework::Vulkan::CImage m_swizzleTablePSMCT16;

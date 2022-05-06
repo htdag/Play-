@@ -1,9 +1,14 @@
 #include <cstring>
 #include "../GsPixelFormats.h"
 #include "../../Log.h"
+#include "../../AppConfig.h"
 #include "GSH_Vulkan.h"
+#include "GSH_VulkanPlatformDefs.h"
+#include "GSH_VulkanDrawDesktop.h"
+#include "GSH_VulkanDrawMobile.h"
 #include "GSH_VulkanDeviceInfo.h"
 #include "vulkan/StructDefs.h"
+#include "vulkan/StructChain.h"
 #include "vulkan/Utils.h"
 
 #define LOG_NAME ("gsh_vulkan")
@@ -50,14 +55,23 @@ Framework::Vulkan::CInstance CGSH_Vulkan::CreateInstance(bool useValidationLayer
 
 	std::vector<const char*> extensions;
 	extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+	extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
 #ifdef _WIN32
 	extensions.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
 #endif
 #ifdef __APPLE__
+#if TARGET_OS_IPHONE
+	extensions.push_back(VK_MVK_IOS_SURFACE_EXTENSION_NAME);
+#else
 	extensions.push_back(VK_MVK_MACOS_SURFACE_EXTENSION_NAME);
 #endif
+#endif
 #ifdef __linux__
+#ifdef __ANDROID__
+	extensions.push_back(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME);
+#else
 	extensions.push_back(VK_KHR_XCB_SURFACE_EXTENSION_NAME);
+#endif
 #endif
 
 	std::vector<const char*> layers;
@@ -71,7 +85,13 @@ Framework::Vulkan::CInstance CGSH_Vulkan::CreateInstance(bool useValidationLayer
 	auto appInfo = Framework::Vulkan::ApplicationInfo();
 	appInfo.pApplicationName = "Play!";
 	appInfo.pEngineName = "Play!";
+#if GSH_VULKAN_IS_DESKTOP
 	appInfo.apiVersion = VK_API_VERSION_1_2;
+#elif GSH_VULKAN_IS_MOBILE
+	appInfo.apiVersion = VK_API_VERSION_1_0;
+#else
+#error Unsupported Vulkan flavor
+#endif
 
 	instanceCreateInfo.pApplicationInfo = &appInfo;
 	instanceCreateInfo.enabledExtensionCount = extensions.size();
@@ -97,9 +117,12 @@ void CGSH_Vulkan::InitializeImpl()
 
 	m_instance.vkGetPhysicalDeviceMemoryProperties(m_context->physicalDevice, &m_context->physicalDeviceMemoryProperties);
 
-	auto surfaceFormats = GetDeviceSurfaceFormats(m_context->physicalDevice);
-	assert(surfaceFormats.size() > 0);
-	m_context->surfaceFormat = surfaceFormats[0];
+	if(m_context->surface)
+	{
+		auto surfaceFormats = GetDeviceSurfaceFormats(m_context->physicalDevice);
+		assert(surfaceFormats.size() > 0);
+		m_context->surfaceFormat = surfaceFormats[0];
+	}
 
 	CreateDevice(m_context->physicalDevice);
 	m_context->device.vkGetDeviceQueue(m_context->device, renderQueueFamily, 0, &m_context->queue);
@@ -127,8 +150,17 @@ void CGSH_Vulkan::InitializeImpl()
 
 	m_frameCommandBuffer = std::make_shared<CFrameCommandBuffer>(m_context);
 	m_clutLoad = std::make_shared<CClutLoad>(m_context, m_frameCommandBuffer);
-	m_draw = std::make_shared<CDraw>(m_context, m_frameCommandBuffer);
-	m_present = std::make_shared<CPresent>(m_context);
+#if GSH_VULKAN_IS_DESKTOP
+	m_draw = std::make_shared<CDrawDesktop>(m_context, m_frameCommandBuffer);
+#elif GSH_VULKAN_IS_MOBILE
+	m_draw = std::make_shared<CDrawMobile>(m_context, m_frameCommandBuffer);
+#else
+#error Unsupported Vulkan flavor
+#endif
+	if(m_context->surface)
+	{
+		m_present = std::make_shared<CPresent>(m_context);
+	}
 	m_transferHost = std::make_shared<CTransferHost>(m_context, m_frameCommandBuffer);
 	m_transferLocal = std::make_shared<CTransferLocal>(m_context, m_frameCommandBuffer);
 
@@ -196,24 +228,21 @@ void CGSH_Vulkan::MarkNewFrame()
 	m_drawCallCount = m_frameCommandBuffer->GetFlushCount();
 	m_frameCommandBuffer->ResetFlushCount();
 	m_frameCommandBuffer->EndFrame();
-	CGSHandler::MarkNewFrame();
 	m_frameCommandBuffer->BeginFrame();
+	CGSHandler::MarkNewFrame();
 }
 
 void CGSH_Vulkan::FlipImpl()
 {
 	auto dispInfo = GetCurrentDisplayInfo();
 	auto fb = make_convertible<DISPFB>(dispInfo.first);
-	auto d = make_convertible<DISPLAY>(dispInfo.second);
+	auto dispBounds = GetDisplayBounds(dispInfo.second);
 
-	unsigned int dispWidth = (d.nW + 1) / (d.nMagX + 1);
-	unsigned int dispHeight = (d.nH + 1);
-
-	bool halfHeight = GetCrtIsInterlaced() && GetCrtIsFrameMode();
-	if(halfHeight) dispHeight /= 2;
-
-	m_present->SetPresentationViewport(GetPresentationViewport());
-	m_present->DoPresent(fb.nPSM, fb.GetBufPtr(), fb.GetBufWidth(), dispWidth, dispHeight);
+	if(m_present)
+	{
+		m_present->SetPresentationViewport(GetPresentationViewport());
+		m_present->DoPresent(fb.nPSM, fb.GetBufPtr(), fb.GetBufWidth(), dispBounds.first, dispBounds.second);
+	}
 
 	PresentBackbuffer();
 	CGSHandler::FlipImpl();
@@ -255,8 +284,6 @@ uint32 CGSH_Vulkan::GetPhysicalDeviceIndex(const std::vector<VkPhysicalDevice>& 
 
 std::vector<uint32_t> CGSH_Vulkan::GetRenderQueueFamilies(VkPhysicalDevice physicalDevice)
 {
-	assert(m_context->surface != VK_NULL_HANDLE);
-
 	auto result = VK_SUCCESS;
 	std::vector<uint32_t> renderQueueFamilies;
 
@@ -296,12 +323,15 @@ std::vector<uint32_t> CGSH_Vulkan::GetRenderQueueFamilies(VkPhysicalDevice physi
 		}
 
 		VkBool32 surfaceSupported = VK_FALSE;
-		result = m_instance.vkGetPhysicalDeviceSurfaceSupportKHR(physicalDevice, queueFamilyIndex, m_context->surface, &surfaceSupported);
-		CHECKVULKANERROR(result);
+		if(m_context->surface)
+		{
+			result = m_instance.vkGetPhysicalDeviceSurfaceSupportKHR(physicalDevice, queueFamilyIndex, m_context->surface, &surfaceSupported);
+			CHECKVULKANERROR(result);
 
-		CLog::GetInstance().Print(LOG_NAME, "Supports surface: %d\r\n", surfaceSupported);
+			CLog::GetInstance().Print(LOG_NAME, "Supports surface: %d\r\n", surfaceSupported);
+		}
 
-		if(graphicsSupported && surfaceSupported)
+		if(graphicsSupported && (!m_context->surface || surfaceSupported))
 		{
 			renderQueueFamilies.push_back(queueFamilyIndex);
 		}
@@ -351,31 +381,53 @@ void CGSH_Vulkan::CreateDevice(VkPhysicalDevice physicalDevice)
 
 	std::vector<const char*> enabledExtensions;
 	enabledExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+#if GSH_VULKAN_IS_DESKTOP
 	enabledExtensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
+#endif
 
 	std::vector<const char*> enabledLayers;
 
-	auto physicalDeviceFeaturesInvocationInterlock = Framework::Vulkan::PhysicalDeviceFragmentShaderInterlockFeaturesEXT();
-	physicalDeviceFeaturesInvocationInterlock.fragmentShaderPixelInterlock = VK_TRUE;
+	Framework::Vulkan::CStructChain createDeviceStructs;
 
-	auto physicalDeviceFeatures2 = Framework::Vulkan::PhysicalDeviceFeatures2KHR();
-	physicalDeviceFeatures2.pNext = &physicalDeviceFeaturesInvocationInterlock;
-	physicalDeviceFeatures2.features.fragmentStoresAndAtomics = VK_TRUE;
-	physicalDeviceFeatures2.features.shaderInt16 = VK_TRUE;
+#if GSH_VULKAN_IS_DESKTOP
+	{
+		auto physicalDeviceFeaturesInvocationInterlock = Framework::Vulkan::PhysicalDeviceFragmentShaderInterlockFeaturesEXT();
+		physicalDeviceFeaturesInvocationInterlock.fragmentShaderPixelInterlock = VK_TRUE;
+		createDeviceStructs.AddStruct(physicalDeviceFeaturesInvocationInterlock);
+	}
+#endif
 
-	auto physicalDeviceVulkan12features = Framework::Vulkan::PhysicalDeviceVulkan12Features();
-	physicalDeviceVulkan12features.pNext = &physicalDeviceFeatures2;
-	physicalDeviceVulkan12features.shaderInt8 = VK_TRUE;
-	physicalDeviceVulkan12features.storageBuffer8BitAccess = VK_TRUE;
-	physicalDeviceVulkan12features.uniformAndStorageBuffer8BitAccess = VK_TRUE;
+	{
+		auto physicalDeviceFeatures2 = Framework::Vulkan::PhysicalDeviceFeatures2KHR();
+#ifndef __APPLE__
+		//MoltenVK doesn't report this properly (probably due to mobile devices supporting buffer stores and not image stores)
+		physicalDeviceFeatures2.features.fragmentStoresAndAtomics = VK_TRUE;
+#endif
+#if GSH_VULKAN_IS_DESKTOP
+		physicalDeviceFeatures2.features.shaderInt16 = VK_TRUE;
+#endif
+		createDeviceStructs.AddStruct(physicalDeviceFeatures2);
+	}
 
-	auto physicalDevice16BitStorageFeatures = Framework::Vulkan::PhysicalDevice16BitStorageFeatures();
-	physicalDevice16BitStorageFeatures.pNext = &physicalDeviceVulkan12features;
-	physicalDevice16BitStorageFeatures.storageBuffer16BitAccess = VK_TRUE;
-	physicalDevice16BitStorageFeatures.uniformAndStorageBuffer16BitAccess = VK_TRUE;
+#if GSH_VULKAN_IS_DESKTOP
+	{
+		auto physicalDeviceVulkan12Features = Framework::Vulkan::PhysicalDeviceVulkan12Features();
+		physicalDeviceVulkan12Features.shaderInt8 = VK_TRUE;
+		physicalDeviceVulkan12Features.storageBuffer8BitAccess = VK_TRUE;
+		physicalDeviceVulkan12Features.uniformAndStorageBuffer8BitAccess = VK_TRUE;
+		createDeviceStructs.AddStruct(physicalDeviceVulkan12Features);
+	}
+
+	{
+		auto physicalDevice16BitStorageFeatures = Framework::Vulkan::PhysicalDevice16BitStorageFeatures();
+		physicalDevice16BitStorageFeatures.storageBuffer16BitAccess = VK_TRUE;
+		physicalDevice16BitStorageFeatures.uniformAndStorageBuffer16BitAccess = VK_TRUE;
+		createDeviceStructs.AddStruct(physicalDevice16BitStorageFeatures);
+	}
+#endif
 
 	auto deviceCreateInfo = Framework::Vulkan::DeviceCreateInfo();
-	deviceCreateInfo.pNext = &physicalDevice16BitStorageFeatures;
+	deviceCreateInfo.pNext = createDeviceStructs.GetNext();
 	deviceCreateInfo.flags = 0;
 	deviceCreateInfo.enabledLayerCount = static_cast<uint32>(enabledLayers.size());
 	deviceCreateInfo.ppEnabledLayerNames = enabledLayers.data();
@@ -385,6 +437,13 @@ void CGSH_Vulkan::CreateDevice(VkPhysicalDevice physicalDevice)
 	deviceCreateInfo.pQueueCreateInfos = &deviceQueueCreateInfo;
 
 	m_context->device = Framework::Vulkan::CDevice(m_instance, physicalDevice, deviceCreateInfo);
+
+	{
+		VkPhysicalDeviceProperties deviceProperties = {};
+		m_context->instance->vkGetPhysicalDeviceProperties(physicalDevice, &deviceProperties);
+		m_context->storageBufferAlignment = deviceProperties.limits.minStorageBufferOffsetAlignment;
+		m_context->computeWorkgroupInvocations = deviceProperties.limits.maxComputeWorkGroupInvocations;
+	}
 }
 
 void CGSH_Vulkan::CreateDescriptorPool()
@@ -407,7 +466,21 @@ void CGSH_Vulkan::CreateDescriptorPool()
 
 	{
 		VkDescriptorPoolSize poolSize = {};
+		poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+		poolSize.descriptorCount = 0x800;
+		poolSizes.push_back(poolSize);
+	}
+
+	{
+		VkDescriptorPoolSize poolSize = {};
 		poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+		poolSize.descriptorCount = 0x800;
+		poolSizes.push_back(poolSize);
+	}
+
+	{
+		VkDescriptorPoolSize poolSize = {};
+		poolSize.type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
 		poolSize.descriptorCount = 0x800;
 		poolSizes.push_back(poolSize);
 	}
@@ -503,12 +576,10 @@ void CGSH_Vulkan::VertexKick(uint8 registerId, uint64 data)
 
 		switch(m_primitiveType)
 		{
-#if 0
 		case PRIM_POINT:
-			if(nDrawingKick) Prim_Point();
-			m_nVtxCount = 1;
+			if(drawingKick) Prim_Point();
+			m_vtxCount = 1;
 			break;
-#endif
 		case PRIM_LINE:
 			if(drawingKick) Prim_Line();
 			m_vtxCount = 2;
@@ -559,6 +630,8 @@ void CGSH_Vulkan::SetRenderingContext(uint64 primReg)
 	auto texA = make_convertible<TEXA>(m_nReg[GS_REG_TEXA]);
 	auto fogCol = make_convertible<FOGCOL>(m_nReg[GS_REG_FOGCOL]);
 	auto scanMask = m_nReg[GS_REG_SCANMSK] & 3;
+	auto colClamp = m_nReg[GS_REG_COLCLAMP] & 1;
+	auto fba = m_nReg[GS_REG_FBA_1 + context] & 1;
 
 	auto pipelineCaps = make_convertible<CDraw::PIPELINE_CAPS>(0);
 	pipelineCaps.hasTexture = prim.nTexture;
@@ -569,7 +642,9 @@ void CGSH_Vulkan::SetRenderingContext(uint64 primReg)
 	pipelineCaps.texClampV = clamp.nWMT;
 	pipelineCaps.hasFog = prim.nFog;
 	pipelineCaps.scanMask = scanMask;
-	pipelineCaps.hasAlphaBlending = prim.nAlpha;
+	pipelineCaps.hasAlphaBlending = prim.nAlpha && m_alphaBlendingEnabled;
+	pipelineCaps.colClamp = colClamp;
+	pipelineCaps.fba = fba;
 	pipelineCaps.hasDstAlphaTest = test.nDestAlphaEnabled;
 	pipelineCaps.dstAlphaTestRef = test.nDestAlphaMode;
 	pipelineCaps.writeDepth = (zbuf.nMask == 0);
@@ -582,6 +657,7 @@ void CGSH_Vulkan::SetRenderingContext(uint64 primReg)
 	{
 	default:
 		assert(false);
+		[[fallthrough]];
 	case PRIM_TRIANGLE:
 	case PRIM_TRIANGLEFAN:
 	case PRIM_TRIANGLESTRIP:
@@ -591,6 +667,9 @@ void CGSH_Vulkan::SetRenderingContext(uint64 primReg)
 	case PRIM_LINE:
 	case PRIM_LINESTRIP:
 		pipelineCaps.primitiveType = CDraw::PIPELINE_PRIMITIVE_LINE;
+		break;
+	case PRIM_POINT:
+		pipelineCaps.primitiveType = CDraw::PIPELINE_PRIMITIVE_POINT;
 		break;
 	}
 
@@ -625,6 +704,12 @@ void CGSH_Vulkan::SetRenderingContext(uint64 primReg)
 			break;
 		}
 
+		//Ignore min filter if we don't have mipmap levels.
+		if(tex1.nMaxMip == 0)
+		{
+			minLinear = magLinear;
+		}
+
 		pipelineCaps.textureUseLinearFiltering = (minLinear && magLinear);
 	}
 
@@ -637,14 +722,14 @@ void CGSH_Vulkan::SetRenderingContext(uint64 primReg)
 	}
 
 	pipelineCaps.depthTestFunction = test.nDepthMethod;
-	if(!test.nDepthEnabled)
+	if(!test.nDepthEnabled || !m_depthTestingEnabled)
 	{
 		pipelineCaps.depthTestFunction = CGSHandler::DEPTH_TEST_ALWAYS;
 	}
 
 	pipelineCaps.alphaTestFunction = test.nAlphaMethod;
 	pipelineCaps.alphaTestFailAction = test.nAlphaFail;
-	if(!test.nAlphaEnabled)
+	if(!test.nAlphaEnabled || !m_alphaTestingEnabled)
 	{
 		pipelineCaps.alphaTestFunction = CGSHandler::ALPHA_TEST_ALWAYS;
 	}
@@ -670,6 +755,7 @@ void CGSH_Vulkan::SetRenderingContext(uint64 primReg)
 	switch(frame.nPsm)
 	{
 	case CGSHandler::PSMCT32:
+	case CGSHandler::PSMZ32:
 		pipelineCaps.maskColor = (fbWriteMask != 0xFFFFFFFF);
 		break;
 	case CGSHandler::PSMCT24:
@@ -749,6 +835,33 @@ void CGSH_Vulkan::SetRenderingContext(uint64 primReg)
 	m_texHeight = tex0.GetHeight();
 }
 
+void CGSH_Vulkan::Prim_Point()
+{
+	auto xyz = make_convertible<XYZ>(m_vtxBuffer[0].position);
+	auto rgbaq = make_convertible<RGBAQ>(m_vtxBuffer[0].rgbaq);
+
+	float x = xyz.GetX();
+	float y = xyz.GetY();
+	uint32 z = xyz.nZ;
+
+	x -= m_primOfsX;
+	y -= m_primOfsY;
+
+	auto color = MakeColor(
+	    rgbaq.nR, rgbaq.nG,
+	    rgbaq.nB, rgbaq.nA);
+
+	// clang-format off
+	CDraw::PRIM_VERTEX vertex =
+	{
+		//x, y, z, color, s, t, q, f
+		  x, y, z, color, 0, 0, 1, 0,
+	};
+	// clang-format on
+
+	m_draw->AddVertices(&vertex, &vertex + 1);
+}
+
 void CGSH_Vulkan::Prim_Line()
 {
 	XYZ pos[2];
@@ -786,6 +899,9 @@ void CGSH_Vulkan::Prim_Line()
 
 			t[0] = uv[0].GetV() / static_cast<float>(m_texHeight);
 			t[1] = uv[1].GetV() / static_cast<float>(m_texHeight);
+
+			m_lastLineU = s[0];
+			m_lastLineV = t[0];
 		}
 		else
 		{
@@ -1037,7 +1153,7 @@ void CGSH_Vulkan::WriteRegisterImpl(uint8 registerId, uint64 data)
 {
 	//Some games such as Silent Hill 2 don't finish their transfers
 	//completely: make sure we push the data to the GS's RAM nevertheless.
-	if(!m_xferBuffer.empty())
+	if(!m_xferBuffer.empty() && (registerId != GS_REG_HWREG))
 	{
 		ProcessHostToLocalTransfer();
 	}
@@ -1051,6 +1167,27 @@ void CGSH_Vulkan::WriteRegisterImpl(uint8 registerId, uint64 data)
 		unsigned int newPrimitiveType = static_cast<unsigned int>(data & 0x07);
 		if(newPrimitiveType != m_primitiveType)
 		{
+			if(m_primitiveType == PRIM_LINE)
+			{
+				//Virtua Fighter 2, Sega Rally 95 (and others):
+				//Draws lines and uses result as CLUT for next draw calls.
+
+				//Optimization: We check if the last drawn line UV matches what might currently be in the CLUT
+				//If it's different, we force reset all saved CLUTs, otherwise, we assume we can keep
+				//what we had previously. This helps reducing the number of compute dispatch needed to update the CLUT
+
+				//Optimization lead: The game draws lines to update the CLUT area very often, but a lot of times
+				//the result doesn't seem to be used. We could probably save a lot by not drawing these lines.
+
+				if(
+				    (m_clutLineU != m_lastLineU) ||
+				    (m_clutLineV != m_lastLineV))
+				{
+					memset(&m_clutStates, 0, sizeof(m_clutStates));
+				}
+				m_clutLineU = m_lastLineU;
+				m_clutLineV = m_lastLineV;
+			}
 			m_draw->FlushVertices();
 		}
 		m_primitiveType = newPrimitiveType;
@@ -1111,8 +1248,12 @@ void CGSH_Vulkan::ProcessHostToLocalTransfer()
 
 void CGSH_Vulkan::ProcessLocalToHostTransfer()
 {
-	//Make sure our local RAM copy is in sync with GPU
-	SyncMemoryCache();
+	bool readsEnabled = CAppConfig::GetInstance().GetPreferenceBoolean(PREF_CGSHANDLER_GS_RAM_READS_ENABLED);
+	if(readsEnabled)
+	{
+		//Make sure our local RAM copy is in sync with GPU
+		SyncMemoryCache();
+	}
 }
 
 void CGSH_Vulkan::ProcessLocalToLocalTransfer()
@@ -1203,10 +1344,6 @@ void CGSH_Vulkan::SyncCLUT(const TEX0& tex0)
 	m_draw->SetClutBufferOffset(clutBufferOffset);
 }
 
-void CGSH_Vulkan::ReadFramebuffer(uint32 width, uint32 height, void* buffer)
-{
-}
-
 uint8* CGSH_Vulkan::GetRam() const
 {
 	return m_memoryCache;
@@ -1215,4 +1352,136 @@ uint8* CGSH_Vulkan::GetRam() const
 Framework::CBitmap CGSH_Vulkan::GetScreenshot()
 {
 	return Framework::CBitmap();
+}
+
+bool CGSH_Vulkan::GetDepthTestingEnabled() const
+{
+	return m_depthTestingEnabled;
+}
+
+void CGSH_Vulkan::SetDepthTestingEnabled(bool depthTestingEnabled)
+{
+	m_depthTestingEnabled = depthTestingEnabled;
+}
+
+bool CGSH_Vulkan::GetAlphaBlendingEnabled() const
+{
+	return m_alphaBlendingEnabled;
+}
+
+void CGSH_Vulkan::SetAlphaBlendingEnabled(bool alphaBlendingEnabled)
+{
+	m_alphaBlendingEnabled = alphaBlendingEnabled;
+}
+
+bool CGSH_Vulkan::GetAlphaTestingEnabled() const
+{
+	return m_alphaTestingEnabled;
+}
+
+void CGSH_Vulkan::SetAlphaTestingEnabled(bool alphaTestingEnabled)
+{
+	m_alphaTestingEnabled = alphaTestingEnabled;
+}
+
+Framework::CBitmap CGSH_Vulkan::GetFramebuffer(uint64 frameReg)
+{
+	Framework::CBitmap result;
+	SendGSCall([&]() { result = GetFramebufferImpl(frameReg); }, true);
+	return result;
+}
+
+Framework::CBitmap CGSH_Vulkan::GetTexture(uint64 tex0Reg, uint32 maxMip, uint64 miptbp1Reg, uint64 miptbp2Reg, uint32 mipLevel)
+{
+	Framework::CBitmap result;
+	SendGSCall([&]() { result = GetTextureImpl(tex0Reg, maxMip, miptbp1Reg, miptbp2Reg, mipLevel); }, true);
+	return result;
+}
+
+int CGSH_Vulkan::GetFramebufferScale()
+{
+	return 1;
+}
+
+const CGSHandler::VERTEX* CGSH_Vulkan::GetInputVertices() const
+{
+	return m_vtxBuffer;
+}
+
+Framework::CBitmap CGSH_Vulkan::GetFramebufferImpl(uint64 frameReg)
+{
+	auto frame = make_convertible<FRAME>(frameReg);
+
+	SyncMemoryCache();
+
+	uint32 frameWidth = frame.GetWidth();
+	uint32 frameHeight = 1024;
+	Framework::CBitmap bitmap;
+
+	switch(frame.nPsm)
+	{
+	case PSMCT32:
+	{
+		bitmap = ReadImage32<CGsPixelFormats::CPixelIndexorPSMCT32>(GetRam(), frame.GetBasePtr(),
+		                                                            frame.nWidth, frameWidth, frameHeight);
+	}
+	break;
+	case PSMCT24:
+	{
+		bitmap = ReadImage32<CGsPixelFormats::CPixelIndexorPSMCT32, 0x00FFFFFF>(GetRam(), frame.GetBasePtr(),
+		                                                                        frame.nWidth, frameWidth, frameHeight);
+	}
+	break;
+	case PSMCT16:
+	{
+		bitmap = ReadImage16<CGsPixelFormats::CPixelIndexorPSMCT16>(GetRam(), frame.GetBasePtr(),
+		                                                            frame.nWidth, frameWidth, frameHeight);
+	}
+	break;
+	case PSMCT16S:
+	{
+		bitmap = ReadImage16<CGsPixelFormats::CPixelIndexorPSMCT16S>(GetRam(), frame.GetBasePtr(),
+		                                                             frame.nWidth, frameWidth, frameHeight);
+	}
+	break;
+	default:
+		assert(false);
+		break;
+	}
+	return bitmap;
+}
+
+Framework::CBitmap CGSH_Vulkan::GetTextureImpl(uint64 tex0Reg, uint32 maxMip, uint64 miptbp1Reg, uint64 miptbp2Reg, uint32 mipLevel)
+{
+	auto tex0 = make_convertible<TEX0>(tex0Reg);
+	auto width = std::max<uint32>(tex0.GetWidth() >> mipLevel, 1);
+	auto height = std::max<uint32>(tex0.GetHeight() >> mipLevel, 1);
+
+	SyncMemoryCache();
+
+	Framework::CBitmap bitmap;
+
+	switch(tex0.nPsm)
+	{
+	case PSMCT32:
+	{
+		bitmap = ReadImage32<CGsPixelFormats::CPixelIndexorPSMCT32>(GetRam(), tex0.GetBufPtr(),
+		                                                            tex0.nBufWidth, tex0.GetWidth(), tex0.GetHeight());
+	}
+	break;
+	case PSMT8:
+	{
+		bitmap = ReadImage8<CGsPixelFormats::CPixelIndexorPSMT8>(GetRam(), tex0.GetBufPtr(),
+		                                                         tex0.nBufWidth, tex0.GetWidth(), tex0.GetHeight());
+	}
+	break;
+	case PSMT4:
+	{
+		bitmap = ReadImage8<CGsPixelFormats::CPixelIndexorPSMT4>(GetRam(), tex0.GetBufPtr(),
+		                                                         tex0.nBufWidth, tex0.GetWidth(), tex0.GetHeight());
+	}
+	break;
+	}
+
+	return bitmap;
 }

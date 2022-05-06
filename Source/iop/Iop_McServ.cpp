@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <states/XmlStateFile.h>
 #include <xml/Utils.h>
+#include "string_format.h"
 #include "../AppConfig.h"
 #include "../PS2VM_Preferences.h"
 #include "../Log.h"
@@ -32,7 +33,7 @@ using namespace Iop;
 
 #define SEPARATOR_CHAR '/'
 
-#define CMD_DELAY_GETINFO 100000
+#define CMD_DELAY_DEFAULT 100000
 
 #define STATE_MEMCARDS_FILE ("iop_mcserv/memcards.xml")
 #define STATE_MEMCARDS_NODE "Memorycards"
@@ -44,7 +45,7 @@ using namespace Iop;
 #define MC_FILE_ATTR_FOLDER (MC_FILE_0400 | MC_FILE_ATTR_EXISTS | MC_FILE_ATTR_SUBDIR | MC_FILE_ATTR_READABLE | MC_FILE_ATTR_WRITEABLE | MC_FILE_ATTR_EXECUTABLE)
 
 // clang-format off
-const char* CMcServ::m_mcPathPreference[2] =
+const char* CMcServ::m_mcPathPreference[MAX_PORTS] =
 {
 	PREF_PS2_MC0_DIRECTORY,
 	PREF_PS2_MC1_DIRECTORY,
@@ -73,6 +74,48 @@ const char* CMcServ::GetMcPathPreference(unsigned int port)
 	return m_mcPathPreference[port];
 }
 
+std::string CMcServ::EncodeMcName(const std::string& inputName)
+{
+	std::string result;
+	for(size_t i = 0; i < inputName.size(); i++)
+	{
+		auto inputChar = inputName[i];
+		if(inputChar == 0) break;
+		//':' is not allowed on Windows
+		if(inputChar == ':')
+		{
+			result += string_format("%%%02X", inputChar);
+		}
+		else
+		{
+			result += inputChar;
+		}
+	}
+	return result;
+}
+
+std::string CMcServ::DecodeMcName(const std::string& inputName)
+{
+	std::string result;
+	for(size_t i = 0; i < inputName.size(); i++)
+	{
+		auto inputChar = inputName[i];
+		if(inputChar == '%')
+		{
+			int decodedChar = 0;
+			int scanCount = sscanf(inputName.c_str() + i, "%%%02X", &decodedChar);
+			assert(scanCount == 1);
+			result += decodedChar;
+			i += 2;
+		}
+		else
+		{
+			result += inputChar;
+		}
+	}
+	return result;
+}
+
 std::string CMcServ::GetId() const
 {
 	return MODULE_NAME;
@@ -91,7 +134,6 @@ void CMcServ::CountTicks(uint32 ticks, CSifMan* sifMan)
 	moduleData->pendingCommandDelay -= std::min<uint32>(moduleData->pendingCommandDelay, ticks);
 	if(moduleData->pendingCommandDelay == 0)
 	{
-		assert(moduleData->pendingCommand == CMD_ID_GETINFO);
 		sifMan->SendCallReply(MODULE_ID, nullptr);
 		moduleData->pendingCommand = CMD_ID_NONE;
 	}
@@ -122,11 +164,16 @@ bool CMcServ::Invoke(uint32 method, uint32* args, uint32 argsSize, uint32* ret, 
 	{
 	case CMD_ID_GETINFO:
 	case 0x78:
+		// Many games seem to be sensitive to the delay response of this function:
+		//- Nights Into Dreams (issues 2 Syncs very close to each other, infinite loop if GetInfo is instantenous)
+		//- Melty Blood Actress Again
+		//- Baroque
+		//- Naruto Shippuden: Ultimate Ninja 5 (if GetInfo doesn't return quickly enough, MC thread is killed and game will hang)
 		GetInfo(args, argsSize, ret, retSize, ram);
-		return false;
 		break;
 	case CMD_ID_OPEN:
 	case 0x71:
+		// Operation Winback 2 expects a delay here, otherwise it hangs trying to read or write a save file
 		Open(args, argsSize, ret, retSize, ram);
 		break;
 	case CMD_ID_CLOSE:
@@ -138,10 +185,12 @@ bool CMcServ::Invoke(uint32 method, uint32* args, uint32 argsSize, uint32* ret, 
 		break;
 	case CMD_ID_READ:
 	case 0x73:
+		// Operation Winback 2 expects a delay here, otherwise it hangs trying to read a save file
 		Read(args, argsSize, ret, retSize, ram);
 		break;
 	case CMD_ID_WRITE:
 	case 0x74:
+		// Operation Winback 2 expects a delay here, otherwise it hangs trying to write a save file
 		Write(args, argsSize, ret, retSize, ram);
 		break;
 	case 0x0A:
@@ -163,8 +212,11 @@ bool CMcServ::Invoke(uint32 method, uint32* args, uint32 argsSize, uint32* ret, 
 	case 0x79:
 		Delete(args, argsSize, ret, retSize, ram);
 		break;
-	case 0x12:
+	case CMD_ID_GETENTSPACE:
 		GetEntSpace(args, argsSize, ret, retSize, ram);
+		break;
+	case CMD_ID_SETTHREADPRIORITY:
+		SetThreadPriority(args, argsSize, ret, retSize, ram);
 		break;
 	case 0x15:
 		GetSlotMax(args, argsSize, ret, retSize, ram);
@@ -182,9 +234,17 @@ bool CMcServ::Invoke(uint32 method, uint32* args, uint32 argsSize, uint32* ret, 
 		break;
 	default:
 		CLog::GetInstance().Warn(LOG_NAME, "Unknown RPC method invoked (0x%08X).\r\n", method);
-		break;
+		return true;
 	}
-	return true;
+
+	// Delay all commands a bit (except ReadFast, which has a different mecanism)
+	// Fixes games which receive the rpc response before they are ready to receive them
+	auto moduleData = reinterpret_cast<MODULEDATA*>(m_ram + m_moduleDataAddr);
+	assert(moduleData->pendingCommand == CMD_ID_NONE);
+	moduleData->pendingCommand = method;
+	moduleData->pendingCommandDelay = CMD_DELAY_DEFAULT;
+
+	return false;
 }
 
 void CMcServ::BuildCustomCode()
@@ -275,6 +335,11 @@ void CMcServ::GetInfo(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize
 	CLog::GetInstance().Print(LOG_NAME, "GetInfo(port = %i, slot = %i, wantType = %i, wantFreeSpace = %i, wantFormatted = %i, retBuffer = 0x%08X);\r\n",
 	                          port, slot, wantType, wantFreeSpace, wantFormatted, args[7]);
 
+	if(HandleInvalidPortOrSlot(port, slot, ret))
+	{
+		return;
+	}
+
 	if(wantType)
 	{
 		retBuffer[0x00] = 2; //2 -> PS2 memory card
@@ -304,16 +369,6 @@ void CMcServ::GetInfo(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize
 	//  -2 if new unformatted card
 	//> -2 on error
 	ret[0] = isKnownCard ? 0 : -1;
-
-	//Many games seem to be sensitive to the delay response of this function:
-	//- Nights Into Dreams (issues 2 Syncs very close to each other, infinite loop if GetInfo is instantenous)
-	//- Melty Blood Actress Again
-	//- Baroque
-	//- Naruto Shippuden: Ultimate Ninja 5 (if GetInfo doesn't return quickly enough, MC thread is killed and game will hang)
-	auto moduleData = reinterpret_cast<MODULEDATA*>(m_ram + m_moduleDataAddr);
-	assert(moduleData->pendingCommand == CMD_ID_NONE);
-	moduleData->pendingCommand = CMD_ID_GETINFO;
-	moduleData->pendingCommandDelay = CMD_DELAY_GETINFO;
 }
 
 void CMcServ::Open(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, uint8* ram)
@@ -325,18 +380,18 @@ void CMcServ::Open(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, u
 	CLog::GetInstance().Print(LOG_NAME, "Open(port = %i, slot = %i, flags = %i, name = '%s');\r\n",
 	                          cmd->port, cmd->slot, cmd->flags, cmd->name);
 
-	if(cmd->port >= MAX_PORTS)
+	if(HandleInvalidPortOrSlot(cmd->port, cmd->slot, ret))
 	{
-		assert(0);
-		ret[0] = -1;
 		return;
 	}
+
+	auto name = EncodeMcName(cmd->name);
 
 	fs::path filePath;
 
 	try
 	{
-		filePath = GetAbsoluteFilePath(cmd->port, cmd->slot, cmd->name);
+		filePath = GetAbsoluteFilePath(cmd->port, cmd->slot, name.c_str());
 	}
 	catch(const std::exception& exception)
 	{
@@ -351,8 +406,15 @@ void CMcServ::Open(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, u
 		uint32 result = -1;
 		try
 		{
-			fs::create_directory(filePath);
-			result = 0;
+			if(fs::exists(filePath))
+			{
+				result = RET_NO_ENTRY;
+			}
+			else
+			{
+				fs::create_directory(filePath);
+				result = 0;
+			}
 		}
 		catch(...)
 		{
@@ -367,7 +429,16 @@ void CMcServ::Open(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, u
 			if(!fs::exists(filePath))
 			{
 				//Create file if it doesn't exist
-				Framework::CreateOutputStdStream(filePath.native());
+				try
+				{
+					Framework::CreateOutputStdStream(filePath.native());
+				}
+				catch(...)
+				{
+					//Might fail in some conditions (ex.: if file is to be created in a directory that doesn't exist).
+					ret[0] = RET_NO_ENTRY;
+					return;
+				}
 			}
 		}
 
@@ -453,7 +524,7 @@ void CMcServ::Seek(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, u
 		break;
 	}
 
-	file->Seek(cmd->offset, origin);
+	file->Seek(static_cast<int32>(cmd->offset), origin);
 	ret[0] = static_cast<uint32>(file->Tell());
 }
 
@@ -482,7 +553,17 @@ void CMcServ::Read(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, u
 		reinterpret_cast<uint32*>(&ram[cmd->paramAddress])[1] = 0;
 	}
 
-	ret[0] = static_cast<uint32>(file->Read(dst, cmd->size));
+	if(file->IsEOF())
+	{
+		ret[0] = 0;
+	}
+	else
+	{
+		ret[0] = static_cast<uint32>(file->Read(dst, cmd->size));
+
+		//Sync pointer for games that write after read without seeking or flushing
+		file->Seek(file->Tell(), Framework::STREAM_SEEK_SET);
+	}
 }
 
 void CMcServ::Write(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, uint8* ram)
@@ -512,6 +593,9 @@ void CMcServ::Write(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, 
 
 	result += static_cast<uint32>(file->Write(dst, cmd->size));
 	ret[0] = result;
+
+	//Force flushing for games that read after write without seeking or flushing
+	file->Flush();
 }
 
 void CMcServ::Flush(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, uint8* ram)
@@ -541,13 +625,19 @@ void CMcServ::ChDir(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, 
 	CLog::GetInstance().Print(LOG_NAME, "ChDir(port = %i, slot = %i, tableAddress = 0x%08X, name = '%s');\r\n",
 	                          cmd->port, cmd->slot, cmd->tableAddress, cmd->name);
 
+	if(HandleInvalidPortOrSlot(cmd->port, cmd->slot, ret))
+	{
+		return;
+	}
+
 	uint32 result = -1;
+	auto& currentDirectory = m_currentDirectory[cmd->port];
 
 	//Write out current directory
 	if(cmd->tableAddress != 0)
 	{
 		//Make sure we return '/' even if the current directory is empty, needed by Silent Hill 3
-		auto curDir = m_currentDirectory.empty() ? std::string(1, SEPARATOR_CHAR) : m_currentDirectory;
+		auto curDir = currentDirectory.empty() ? std::string(1, SEPARATOR_CHAR) : currentDirectory;
 
 		const size_t maxCurDirSize = 256;
 		char* currentDirOut = reinterpret_cast<char*>(ram + cmd->tableAddress);
@@ -557,7 +647,7 @@ void CMcServ::ChDir(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, 
 	try
 	{
 		std::string newCurrentDirectory;
-		std::string requestedDirectory(cmd->name);
+		std::string requestedDirectory = EncodeMcName(cmd->name);
 
 		if(!requestedDirectory.empty() && (requestedDirectory[0] == SEPARATOR_CHAR))
 		{
@@ -573,7 +663,7 @@ void CMcServ::ChDir(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, 
 		}
 		else
 		{
-			newCurrentDirectory = m_currentDirectory + SEPARATOR_CHAR + requestedDirectory;
+			newCurrentDirectory = currentDirectory + SEPARATOR_CHAR + requestedDirectory;
 		}
 
 		auto mcPath = CAppConfig::GetInstance().GetPreferencePath(m_mcPathPreference[cmd->port]);
@@ -586,7 +676,7 @@ void CMcServ::ChDir(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, 
 		}
 		else if(fs::exists(hostPath) && fs::is_directory(hostPath))
 		{
-			m_currentDirectory = newCurrentDirectory;
+			currentDirectory = newCurrentDirectory;
 			result = 0;
 		}
 		else
@@ -614,10 +704,8 @@ void CMcServ::GetDir(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize,
 	CLog::GetInstance().Print(LOG_NAME, "GetDir(port = %i, slot = %i, flags = %i, maxEntries = %i, tableAddress = 0x%08X, name = '%s');\r\n",
 	                          cmd->port, cmd->slot, cmd->flags, cmd->maxEntries, cmd->tableAddress, cmd->name);
 
-	if(cmd->port >= MAX_PORTS)
+	if(HandleInvalidPortOrSlot(cmd->port, cmd->slot, ret))
 	{
-		assert(0);
-		ret[0] = -1;
 		return;
 	}
 
@@ -630,7 +718,7 @@ void CMcServ::GetDir(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize,
 			auto mcPath = CAppConfig::GetInstance().GetPreferencePath(m_mcPathPreference[cmd->port]);
 			if(cmd->name[0] != SEPARATOR_CHAR)
 			{
-				mcPath = Iop::PathUtils::MakeHostPath(mcPath, m_currentDirectory.c_str());
+				mcPath = Iop::PathUtils::MakeHostPath(mcPath, m_currentDirectory[cmd->port].c_str());
 			}
 			mcPath = fs::absolute(mcPath);
 
@@ -670,6 +758,11 @@ void CMcServ::SetFileInfo(uint32* args, uint32 argsSize, uint32* ret, uint32 ret
 	auto cmd = reinterpret_cast<const CMD*>(args);
 	CLog::GetInstance().Print(LOG_NAME, "SetFileInfo(port = %i, slot = %i, flags = %i, name = '%s');\r\n", cmd->port, cmd->slot, cmd->flags, cmd->name);
 
+	if(HandleInvalidPortOrSlot(cmd->port, cmd->slot, ret))
+	{
+		return;
+	}
+
 	auto entry = reinterpret_cast<ENTRY*>(ram + cmd->tableAddress);
 
 	auto flags = cmd->flags;
@@ -684,6 +777,12 @@ void CMcServ::SetFileInfo(uint32* args, uint32 argsSize, uint32* ret, uint32 ret
 		{
 			try
 			{
+				if(!fs::exists(filePath1))
+				{
+					ret[0] = RET_NO_ENTRY;
+					return;
+				}
+
 				fs::rename(filePath1, filePath2);
 			}
 			catch(...)
@@ -710,6 +809,11 @@ void CMcServ::Delete(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize,
 	auto cmd = reinterpret_cast<const CMD*>(args);
 
 	CLog::GetInstance().Print(LOG_NAME, "Delete(port = %d, slot = %d, name = '%s');\r\n", cmd->port, cmd->slot, cmd->name);
+
+	if(HandleInvalidPortOrSlot(cmd->port, cmd->slot, ret))
+	{
+		return;
+	}
 
 	try
 	{
@@ -752,25 +856,49 @@ void CMcServ::GetEntSpace(uint32* args, uint32 argsSize, uint32* ret, uint32 ret
 	CLog::GetInstance().Print(LOG_NAME, "GetEntSpace(port = %i, slot = %i, flags = %i, name = '%s');\r\n",
 	                          cmd->port, cmd->slot, cmd->flags, cmd->name);
 
+	if(HandleInvalidPortOrSlot(cmd->port, cmd->slot, ret))
+	{
+		return;
+	}
+
 	auto mcPath = CAppConfig::GetInstance().GetPreferencePath(m_mcPathPreference[cmd->port]);
 	auto savePath = Iop::PathUtils::MakeHostPath(mcPath, cmd->name);
 
-	if(fs::exists(savePath) && fs::is_directory(savePath))
+	try
 	{
-		// Arbitrarity number, allows Drakengard to detect MC
-		ret[0] = 0xFE;
+		if(fs::exists(savePath) && fs::is_directory(savePath))
+		{
+			// Arbitrarity number, allows Drakengard to detect MC
+			ret[0] = 0xFE;
+		}
+		else
+		{
+			ret[0] = RET_NO_ENTRY;
+		}
 	}
-	else
+	catch(const std::exception& exception)
 	{
-		ret[0] = RET_NO_ENTRY;
+		CLog::GetInstance().Warn(LOG_NAME, "Error while executing GetEntSpace: %s.\r\n", exception.what());
+		ret[0] = -1;
 	}
+}
+
+void CMcServ::SetThreadPriority(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, uint8* ram)
+{
+	auto cmd = reinterpret_cast<CMD*>(args);
+	uint32 priority = *reinterpret_cast<uint32*>(cmd->name);
+
+	CLog::GetInstance().Print(LOG_NAME, "SetThreadPriority(priority = %d);\r\n", priority);
+
+	//We don't really care about thread priority here, just report a success
+	ret[0] = 0;
 }
 
 void CMcServ::GetSlotMax(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, uint8* ram)
 {
 	int port = args[1];
 	CLog::GetInstance().Print(LOG_NAME, "GetSlotMax(port = %i);\r\n", port);
-	ret[0] = 1;
+	ret[0] = MAX_SLOTS;
 }
 
 bool CMcServ::ReadFast(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, uint8* ram)
@@ -788,7 +916,9 @@ bool CMcServ::ReadFast(uint32* args, uint32 argsSize, uint32* ret, uint32 retSiz
 		return true;
 	}
 
-	ret[0] = 1;
+	//Returns the amount of bytes read
+	assert(cmd->size >= file->GetRemainingLength());
+	ret[0] = cmd->size;
 
 	auto moduleData = reinterpret_cast<MODULEDATA*>(m_ram + m_moduleDataAddr);
 	moduleData->readFastHandle = cmd->handle;
@@ -810,7 +940,6 @@ void CMcServ::WriteFast(uint32* args, uint32 argsSize, uint32* ret, uint32 retSi
 	if(file == nullptr)
 	{
 		ret[0] = RET_PERMISSION_DENIED;
-		assert(0);
 		return;
 	}
 
@@ -836,6 +965,27 @@ void CMcServ::GetVersionInformation(uint32* args, uint32 argsSize, uint32* ret, 
 	}
 
 	CLog::GetInstance().Print(LOG_NAME, "Init();\r\n");
+}
+
+bool CMcServ::HandleInvalidPortOrSlot(uint32 port, uint32 slot, uint32* ret)
+{
+	if(port >= MAX_PORTS)
+	{
+		CLog::GetInstance().Warn(LOG_NAME, "Called mc function with invalid port %d\r\n", port);
+		ret[0] = -1;
+		return true;
+	}
+
+	if(slot >= MAX_SLOTS)
+	{
+		//Just warn if an invalid slot is specified. Should not be a big deal since we never use that parameter
+		//in our functions. It shouldn't also matter since we don't support multitap.
+		//Note that some games specify 'slot = 1' while never checking GetSlotMax:
+		//- Dragon Quest 8
+		CLog::GetInstance().Warn(LOG_NAME, "Called mc function with invalid slot %d\r\n", slot);
+	}
+
+	return false;
 }
 
 void CMcServ::StartReadFast(CMIPS& context)
@@ -929,7 +1079,7 @@ fs::path CMcServ::GetAbsoluteFilePath(unsigned int port, unsigned int slot, cons
 	}
 	else
 	{
-		return Iop::PathUtils::MakeHostPath(Iop::PathUtils::MakeHostPath(mcPath, m_currentDirectory.c_str()), name);
+		return Iop::PathUtils::MakeHostPath(Iop::PathUtils::MakeHostPath(mcPath, m_currentDirectory[port].c_str()), name);
 	}
 }
 
@@ -988,6 +1138,13 @@ void CMcServ::CPathFinder::Search(const fs::path& basePath, const char* filter)
 	m_basePath = basePath;
 
 	std::string filterPathString = filter;
+
+	//Resolve relative paths (only when filter starts with one)
+	if(filterPathString.find("./") == 0)
+	{
+		filterPathString = filterPathString.substr(1);
+	}
+
 	if(filterPathString[0] != '/')
 	{
 		filterPathString = "/" + filterPathString;
@@ -1070,12 +1227,13 @@ void CMcServ::CPathFinder::SearchRecurse(const fs::path& path)
 			ENTRY entry;
 			memset(&entry, 0, sizeof(entry));
 
-			strncpy(reinterpret_cast<char*>(entry.name), relativePath.filename().string().c_str(), 0x1F);
+			auto entryName = DecodeMcName(relativePath.filename().string());
+			strncpy(reinterpret_cast<char*>(entry.name), entryName.c_str(), 0x1F);
 			entry.name[0x1F] = 0;
 
 			if(fs::is_directory(*elementIterator))
 			{
-				entry.size = 0;
+				entry.size = CountEntries(*elementIterator);
 				entry.attributes = MC_FILE_ATTR_FOLDER;
 			}
 			else
@@ -1109,4 +1267,15 @@ void CMcServ::CPathFinder::SearchRecurse(const fs::path& path)
 			SearchRecurse(*elementIterator);
 		}
 	}
+}
+
+uint32 CMcServ::CPathFinder::CountEntries(const fs::path& path)
+{
+	uint32 entryCount = 0;
+	assert(fs::is_directory(path));
+	for(auto& entry : fs::directory_iterator(path))
+	{
+		entryCount++;
+	}
+	return entryCount;
 }

@@ -4,51 +4,38 @@ buildscript {
 	repositories {
 		google()
 		mavenCentral()
-		jcenter()
 	}
 
 	dependencies {
-		classpath 'com.android.tools.build:gradle:4.2.1'
-		classpath 'org.ajoberstar.grgit:grgit-gradle:4.1.0'
+		classpath 'com.android.tools.build:gradle:7.1.2'
+		classpath 'org.ajoberstar.grgit:grgit-gradle:4.1.1'
 	}
 }
 
 project.ext {
-	keyStorePropFile = rootProject.file('keystore.properties')
-	signingEnabled = keyStorePropFile.exists()
-	git = org.ajoberstar.grgit.Grgit.open()
+	signingEnabled = project.hasProperty("PLAY_RELEASE_STORE_FILE");
+	git = org.ajoberstar.grgit.Grgit.open(currentDir: project.rootDir)
 	gitVersionCode = git.tag.list().size()
 	gitVersionName = "${git.describe()}"
 }
 
 project.afterEvaluate {
 	preBuild.dependsOn 'copyPatchesFile'
-
-	def configName = 'release'
-	if(project.ext.signingEnabled && android.signingConfigs.hasProperty(configName)) {
-		def props = new Properties()
-		props.load(new FileInputStream(project.ext.keyStorePropFile))
-		android.signingConfigs[configName].storeFile = file(props['storeFile'])
-		android.signingConfigs[configName].storePassword = props['storePassword']
-		android.signingConfigs[configName].keyAlias = props['keyAlias']
-		android.signingConfigs[configName].keyPassword = props['keyPassword']
-	}
 }
 
 android {
 	repositories {
 		google()
-		jcenter()
 		mavenCentral()
 	}
 
-	compileSdkVersion 'android-29'
+	compileSdkVersion 'android-30'
 
 	defaultConfig {
 		versionCode (100 + gitVersionCode)
 		versionName gitVersionName
 		minSdkVersion 19
-		targetSdkVersion 29
+		targetSdkVersion 30
 		externalNativeBuild {
 			cmake {
 				arguments "-DANDROID_ARM_NEON=TRUE", "-DANDROID_TOOLCHAIN=clang",
@@ -67,16 +54,23 @@ android {
 	dependencies {
 		api 'androidx.appcompat:appcompat:1.2.0'
 		api 'androidx.preference:preference:1.1.1'
+		implementation 'androidx.documentfile:documentfile:1.0.1'
 		api 'org.apache.commons:commons-lang3:3.4'
 		api 'commons-io:commons-io:2.5'
 	}
 
 	signingConfigs {
-		release {
-			storeFile file('store.keystore')
-			storePassword ''
-			keyAlias ''
-			keyPassword ''
+		if(project.ext.signingEnabled) {
+			release {
+				storeFile file(PLAY_RELEASE_STORE_FILE)
+				storePassword PLAY_RELEASE_STORE_PASSWORD
+				keyAlias PLAY_RELEASE_KEY_ALIAS
+				keyPassword PLAY_RELEASE_KEY_PASSWORD
+			}
+		} else {
+			release {
+
+			}
 		}
 	}
 
@@ -94,11 +88,12 @@ android {
 			buildConfigField "java.util.Date", "buildTime", "new java.util.Date(" + System.currentTimeMillis() + "L)"
 		}
 	}
-
 	packagingOptions {
-		exclude 'META-INF/LICENSE.txt'
-		exclude 'META-INF/NOTICE.txt'
+		resources {
+			excludes += ['META-INF/LICENSE.txt', 'META-INF/NOTICE.txt']
+		}
 	}
+
 
 	task copyPatchesFile(type: Copy) {
 		from '../patches.xml'
@@ -107,8 +102,7 @@ android {
 
 	sourceSets.main {
 		java.srcDirs = [ '../Source/ui_android/java' ]
-		jni.srcDirs = []
-		jniLibs.srcDir 'src/main/libs'
+        jniLibs.srcDir 'src/main/libs'
 	}
 
 	externalNativeBuild {

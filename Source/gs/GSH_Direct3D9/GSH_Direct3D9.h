@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../gs/GSHandler.h"
+#include "../../gs/GsDebuggerInterface.h"
 #include "../../gs/GsTextureCache.h"
 #include "win32/Window.h"
 #include "win32/ComPtr.h"
@@ -11,18 +12,9 @@
 #endif
 #include <d3d9.h>
 
-class CGSH_Direct3D9 : public CGSHandler
+class CGSH_Direct3D9 : public CGSHandler, public CGsDebuggerInterface
 {
 public:
-	struct VERTEX
-	{
-		uint64 nPosition;
-		uint64 nRGBAQ;
-		uint64 nUV;
-		uint64 nST;
-		uint8 nFog;
-	};
-
 	CGSH_Direct3D9(Framework::Win32::CWindow*);
 	virtual ~CGSH_Direct3D9() = default;
 
@@ -30,20 +22,22 @@ public:
 	void ProcessLocalToHostTransfer() override;
 	void ProcessLocalToLocalTransfer() override;
 	void ProcessClutTransfer(uint32, uint32) override;
-	void ReadFramebuffer(uint32, uint32, void*) override;
 
-	bool GetDepthTestingEnabled() const;
-	void SetDepthTestingEnabled(bool);
+	//Debugger Interface
+	bool GetDepthTestingEnabled() const override;
+	void SetDepthTestingEnabled(bool) override;
 
-	bool GetAlphaBlendingEnabled() const;
-	void SetAlphaBlendingEnabled(bool);
+	bool GetAlphaBlendingEnabled() const override;
+	void SetAlphaBlendingEnabled(bool) override;
 
-	bool GetAlphaTestingEnabled() const;
-	void SetAlphaTestingEnabled(bool);
+	bool GetAlphaTestingEnabled() const override;
+	void SetAlphaTestingEnabled(bool) override;
 
-	Framework::CBitmap GetFramebuffer(uint64);
-	Framework::CBitmap GetTexture(uint64, uint32, uint64, uint64, uint32);
-	const VERTEX* GetInputVertices() const;
+	Framework::CBitmap GetFramebuffer(uint64) override;
+	Framework::CBitmap GetTexture(uint64, uint32, uint64, uint64, uint32) override;
+	int GetFramebufferScale() override;
+
+	const VERTEX* GetInputVertices() const override;
 
 	static uint32 Color_Ps2ToDx9(uint32);
 

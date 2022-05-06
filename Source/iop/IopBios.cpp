@@ -13,9 +13,11 @@
 #include "../Ps2Const.h"
 #include "../MipsExecutor.h"
 #include "Iop_Intc.h"
+#include "../states/MemoryStateFile.h"
 #include "../states/StructCollectionStateFile.h"
 
 #ifdef _IOP_EMULATE_MODULES
+#include "Iop_IomanX.h"
 #include "Iop_Naplink.h"
 #endif
 
@@ -44,6 +46,8 @@
 #define STATE_MODULES ("iopbios/dyn_modules.xml")
 #define STATE_MODULE_IMPORT_TABLE_ADDRESS ("ImportTableAddress")
 
+#define STATE_MODULESTARTREQUESTS ("iopbios/module_start_requests")
+
 #define BIOS_THREAD_LINK_HEAD_BASE (CIopBios::CONTROL_BLOCK_START + 0x0000)
 #define BIOS_CURRENT_THREAD_ID_BASE (CIopBios::CONTROL_BLOCK_START + 0x0008)
 #define BIOS_CURRENT_TIME_BASE (CIopBios::CONTROL_BLOCK_START + 0x0010)
@@ -71,11 +75,11 @@
 #define BIOS_VPL_SIZE (sizeof(CIopBios::VPL) * CIopBios::MAX_VPL)
 #define BIOS_MEMORYBLOCK_BASE (BIOS_VPL_BASE + BIOS_VPL_SIZE)
 #define BIOS_MEMORYBLOCK_SIZE (sizeof(Iop::MEMORYBLOCK) * CIopBios::MAX_MEMORYBLOCK)
-#define BIOS_MODULESTARTREQUEST_BASE (BIOS_MEMORYBLOCK_BASE + BIOS_MEMORYBLOCK_SIZE)
-#define BIOS_MODULESTARTREQUEST_SIZE (sizeof(CIopBios::MODULESTARTREQUEST) * CIopBios::MAX_MODULESTARTREQUEST)
-#define BIOS_LOADEDMODULE_BASE (BIOS_MODULESTARTREQUEST_BASE + BIOS_MODULESTARTREQUEST_SIZE)
+#define BIOS_LOADEDMODULE_BASE (BIOS_MEMORYBLOCK_BASE + BIOS_MEMORYBLOCK_SIZE)
 #define BIOS_LOADEDMODULE_SIZE (sizeof(CIopBios::LOADEDMODULE) * CIopBios::MAX_LOADEDMODULE)
-#define BIOS_CALCULATED_END (BIOS_LOADEDMODULE_BASE + BIOS_LOADEDMODULE_SIZE)
+#define BIOS_INTSTACK_BASE (BIOS_LOADEDMODULE_BASE + BIOS_LOADEDMODULE_SIZE)
+#define BIOS_INTSTACK_SIZE (0x800)
+#define BIOS_CALCULATED_END (BIOS_INTSTACK_BASE + BIOS_INTSTACK_SIZE)
 
 #define SYSCALL_EXITTHREAD 0x666
 #define SYSCALL_RETURNFROMEXCEPTION 0x667
@@ -98,8 +102,7 @@ CIopBios::CIopBios(CMIPS& cpu, uint8* ram, uint32 ramSize, uint8* spr)
     , m_threadFinishAddress(0)
     , m_returnFromExceptionAddress(0)
     , m_idleFunctionAddress(0)
-    , m_moduleStarterThreadProcAddress(0)
-    , m_moduleStarterThreadId(0)
+    , m_moduleStarterProcAddress(0)
     , m_alarmThreadProcAddress(0)
     , m_vblankHandlerAddress(0)
     , m_threads(reinterpret_cast<THREAD*>(&m_ram[BIOS_THREADS_BASE]), 1, MAX_THREAD)
@@ -133,7 +136,7 @@ void CIopBios::Reset(const Iop::SifManPtr& sifMan)
 		m_threadFinishAddress = AssembleThreadFinish(assembler);
 		m_returnFromExceptionAddress = AssembleReturnFromException(assembler);
 		m_idleFunctionAddress = AssembleIdleFunction(assembler);
-		m_moduleStarterThreadProcAddress = AssembleModuleStarterThreadProc(assembler);
+		m_moduleStarterProcAddress = AssembleModuleStarterProc(assembler);
 		m_alarmThreadProcAddress = AssembleAlarmThreadProc(assembler);
 		m_vblankHandlerAddress = AssembleVblankHandler(assembler);
 		assert(BIOS_HANDLERS_END > ((assembler.GetProgramSize() * 4) + BIOS_HANDLERS_BASE));
@@ -251,6 +254,11 @@ void CIopBios::Reset(const Iop::SifManPtr& sifMan)
 		m_mcserv = std::make_shared<Iop::CMcServ>(*this, *m_sifMan, *m_sifCmd, *m_sysmem, m_ram);
 		RegisterModule(m_mcserv);
 	}
+	{
+		m_powerOff = std::make_shared<Iop::CPowerOff>(*m_sifMan);
+		RegisterModule(m_powerOff);
+	}
+	RegisterModule(std::make_shared<Iop::CIomanX>(*m_ioman));
 	//RegisterModule(std::make_shared<Iop::CNaplink>(*m_sifMan, *m_ioman));
 	{
 		m_padman = std::make_shared<Iop::CPadMan>();
@@ -332,6 +340,8 @@ void CIopBios::SaveState(Framework::CZipArchiveWriter& archive)
 	{
 		module->SaveState(archive);
 	}
+
+	archive.InsertFile(new CMemoryStateFile(STATE_MODULESTARTREQUESTS, m_moduleStartRequests, sizeof(m_moduleStartRequests)));
 }
 
 void CIopBios::LoadState(Framework::CZipArchiveReader& archive)
@@ -369,6 +379,8 @@ void CIopBios::LoadState(Framework::CZipArchiveReader& archive)
 		}
 	}
 
+	archive.BeginReadFile(STATE_MODULESTARTREQUESTS)->Read(m_moduleStartRequests, sizeof(m_moduleStartRequests));
+
 #ifdef _IOP_EMULATE_MODULES
 	//Make sure HLE modules are properly registered
 	for(const auto& loadedModule : m_loadedModules)
@@ -405,50 +417,59 @@ bool CIopBios::IsIdle()
 
 void CIopBios::InitializeModuleStarter()
 {
-	ModuleStartRequestHead() = 0;
-	ModuleStartRequestFree() = BIOS_MODULESTARTREQUEST_BASE;
+	memset(m_moduleStartRequests, 0, sizeof(m_moduleStartRequests));
+
+	ModuleStartRequestHead() = MODULESTARTREQUEST::INVALID_PTR;
+	ModuleStartRequestFree() = 0;
 
 	//Initialize Module Load Request Free List
 	for(unsigned int i = 0; i < (MAX_MODULESTARTREQUEST - 1); i++)
 	{
-		auto moduleStartRequest = reinterpret_cast<MODULESTARTREQUEST*>(m_ram + BIOS_MODULESTARTREQUEST_BASE) + i;
-		moduleStartRequest->nextPtr = reinterpret_cast<uint8*>(moduleStartRequest + 1) - m_ram;
+		auto moduleStartRequest = &m_moduleStartRequests[i];
+		moduleStartRequest->nextPtr = i + 1;
 	}
 
-	m_moduleStarterThreadId = CreateThread(m_moduleStarterThreadProcAddress, MODULE_INIT_PRIORITY, DEFAULT_STACKSIZE, 0, 0);
-	StartThread(m_moduleStarterThreadId, 0);
+	m_moduleStartRequests[MAX_MODULESTARTREQUEST - 1].nextPtr = MODULESTARTREQUEST::INVALID_PTR;
 }
 
-void CIopBios::RequestModuleStart(bool stopRequest, uint32 moduleId, const char* path, const char* args, unsigned int argsLength)
+void CIopBios::RequestModuleStart(MODULESTARTREQUEST_SOURCE requestSource, bool stopRequest, uint32 moduleId, const char* path, const char* args, unsigned int argsLength)
 {
 	uint32 requestPtr = ModuleStartRequestFree();
-	assert(requestPtr != 0);
-	if(requestPtr == 0)
+	assert(requestPtr != MODULESTARTREQUEST::INVALID_PTR);
+	if(requestPtr == MODULESTARTREQUEST::INVALID_PTR)
 	{
 		CLog::GetInstance().Warn(LOGNAME, "Too many modules to be loaded.");
 		return;
 	}
 
-	auto moduleStartRequest = reinterpret_cast<MODULESTARTREQUEST*>(m_ram + requestPtr);
+	auto moduleStartRequest = &m_moduleStartRequests[requestPtr];
 
 	//Unlink from free list and link in active list (at the end)
 	{
 		ModuleStartRequestFree() = moduleStartRequest->nextPtr;
 
 		uint32* currentPtr = &ModuleStartRequestHead();
-		while(*currentPtr != 0)
+		while(*currentPtr != MODULESTARTREQUEST::INVALID_PTR)
 		{
-			auto currentModuleLoadRequest = reinterpret_cast<MODULESTARTREQUEST*>(m_ram + *currentPtr);
+			auto currentModuleLoadRequest = &m_moduleStartRequests[*currentPtr];
 			currentPtr = &currentModuleLoadRequest->nextPtr;
 		}
 
 		*currentPtr = requestPtr;
 
-		moduleStartRequest->nextPtr = 0;
+		moduleStartRequest->nextPtr = MODULESTARTREQUEST::INVALID_PTR;
+	}
+
+	int32 requesterThreadId = -1;
+	if(requestSource == MODULESTARTREQUEST_SOURCE::LOCAL)
+	{
+		requesterThreadId = m_currentThreadId;
+		SleepThread();
 	}
 
 	moduleStartRequest->moduleId = moduleId;
 	moduleStartRequest->stopRequest = stopRequest;
+	moduleStartRequest->requesterThreadId = requesterThreadId;
 
 	assert((strlen(path) + 1) <= MODULESTARTREQUEST::MAX_PATH_SIZE);
 	strncpy(moduleStartRequest->path, path, MODULESTARTREQUEST::MAX_PATH_SIZE);
@@ -457,9 +478,9 @@ void CIopBios::RequestModuleStart(bool stopRequest, uint32 moduleId, const char*
 	memcpy(moduleStartRequest->args, args, argsLength);
 	moduleStartRequest->argsLength = argsLength;
 
+	uint32 moduleStarterThreadId = TriggerCallback(m_moduleStarterProcAddress);
 	//Make sure thread runs at proper priority (Burnout 3 changes priority)
-	ChangeThreadPriority(m_moduleStarterThreadId, MODULE_INIT_PRIORITY);
-	WakeupThread(m_moduleStarterThreadId, false);
+	ChangeThreadPriority(moduleStarterThreadId, MODULE_INIT_PRIORITY);
 }
 
 void CIopBios::ProcessModuleStart()
@@ -473,17 +494,15 @@ void CIopBios::ProcessModuleStart()
 		    return copyAddress;
 	    };
 
-	assert(m_currentThreadId == m_moduleStarterThreadId);
-
 	uint32 requestPtr = ModuleStartRequestHead();
-	assert(requestPtr != 0);
-	if(requestPtr == 0)
+	assert(requestPtr != MODULESTARTREQUEST::INVALID_PTR);
+	if(requestPtr == MODULESTARTREQUEST::INVALID_PTR)
 	{
 		CLog::GetInstance().Print(LOGNAME, "Asked to load module when none was requested.");
 		return;
 	}
 
-	auto moduleStartRequest = reinterpret_cast<MODULESTARTREQUEST*>(m_ram + requestPtr);
+	auto moduleStartRequest = &m_moduleStartRequests[requestPtr];
 
 	//Unlink from active list and link in free list
 	{
@@ -491,15 +510,6 @@ void CIopBios::ProcessModuleStart()
 
 		moduleStartRequest->nextPtr = ModuleStartRequestFree();
 		ModuleStartRequestFree() = requestPtr;
-	}
-
-	assert(m_currentThreadId == m_moduleStarterThreadId);
-
-	//Reset stack pointer
-	{
-		auto thread = GetThread(m_moduleStarterThreadId);
-		assert(thread);
-		m_cpu.m_State.nGPR[CMIPS::SP].nV0 = thread->stackBase + thread->stackSize - STACK_FRAME_RESERVE_SIZE;
 	}
 
 	auto loadedModule = m_loadedModules[moduleStartRequest->moduleId];
@@ -556,10 +566,12 @@ void CIopBios::ProcessModuleStart()
 		m_cpu.m_State.nGPR[CMIPS::A0].nD0 = static_cast<int32>(-1);
 	}
 
-	m_cpu.m_State.nGPR[CMIPS::SP].nV0 -= 4;
+	//Allocate stack space for spilling params
+	m_cpu.m_State.nGPR[CMIPS::SP].nV0 -= STACK_FRAME_RESERVE_SIZE;
 
 	m_cpu.m_State.nGPR[CMIPS::S0].nV0 = moduleStartRequest->moduleId;
 	m_cpu.m_State.nGPR[CMIPS::S1].nV0 = moduleStartRequest->stopRequest;
+	m_cpu.m_State.nGPR[CMIPS::S2].nV0 = moduleStartRequest->requesterThreadId;
 	m_cpu.m_State.nGPR[CMIPS::GP].nV0 = loadedModule->gp;
 	m_cpu.m_State.nGPR[CMIPS::RA].nV0 = m_cpu.m_State.nPC;
 	m_cpu.m_State.nPC = loadedModule->entryPoint;
@@ -569,6 +581,7 @@ void CIopBios::FinishModuleStart()
 {
 	uint32 moduleId = m_cpu.m_State.nGPR[CMIPS::S0].nV0;
 	uint32 stopRequest = m_cpu.m_State.nGPR[CMIPS::S1].nV0;
+	int32 requesterThreadId = static_cast<int32>(m_cpu.m_State.nGPR[CMIPS::S2].nV0);
 	auto moduleResidentState = static_cast<MODULE_RESIDENT_STATE>(m_cpu.m_State.nGPR[CMIPS::A0].nV0 & 0x3);
 
 	auto loadedModule = m_loadedModules[moduleId];
@@ -593,11 +606,22 @@ void CIopBios::FinishModuleStart()
 	//some games disable interrupts but never enable them back! (The Mark of Kri)
 	m_cpu.m_State.nCOP0[CCOP_SCU::STATUS] |= CMIPS::STATUS_IE;
 
-	//We need to notify the EE that the load request is over
-	m_sifMan->SendCallReply(Iop::CLoadcore::MODULE_ID, nullptr);
+	if(requesterThreadId == -1)
+	{
+		//If requesterthreadId is -1, we assume that it came from LOADCORE SIF module
+		//We need to notify the EE that the load request is over
+		m_sifMan->SendCallReply(Iop::CLoadcore::MODULE_ID, nullptr);
+	}
+	else
+	{
+		WakeupThread(requesterThreadId, false);
+	}
+
+	//Finish our thread
+	ExitThread();
 }
 
-int32 CIopBios::LoadModule(const char* path)
+int32 CIopBios::LoadModuleFromPath(const char* path, uint32 loadAddress, bool ownsMemory)
 {
 #ifdef _IOP_EMULATE_MODULES
 	//This is needed by some homebrew (ie.: doom.elf) that load modules from BIOS
@@ -616,38 +640,39 @@ int32 CIopBios::LoadModule(const char* path)
 	Iop::Ioman::CScopedFile file(handle, *m_ioman);
 	auto stream = m_ioman->GetFileStream(file);
 	CElfFile module(*stream);
-	return LoadModule(module, path);
+	return LoadModule(module, path, loadAddress, ownsMemory);
 }
 
-int32 CIopBios::LoadModule(uint32 modulePtr)
+int32 CIopBios::LoadModuleFromAddress(uint32 modulePtr, uint32 loadAddress, bool ownsMemory)
 {
 	CELF module(m_ram + modulePtr);
-	return LoadModule(module, "");
+	return LoadModule(module, "", loadAddress, ownsMemory);
 }
 
 int32 CIopBios::LoadModuleFromHost(uint8* modulePtr)
 {
 	CELF module(modulePtr);
-	return LoadModule(module, "");
+	return LoadModule(module, "", ~0U, true);
 }
 
-int32 CIopBios::LoadModule(CELF& elf, const char* path)
+int32 CIopBios::LoadModule(CELF& elf, const char* path, uint32 loadAddress, bool ownsMemory)
 {
 	uint32 loadedModuleId = m_loadedModules.Allocate();
 	assert(loadedModuleId != -1);
 	if(loadedModuleId == -1) return -1;
 
 	auto loadedModule = m_loadedModules[loadedModuleId];
+	loadedModule->ownsMemory = ownsMemory;
 
 	ExecutableRange moduleRange;
-	uint32 entryPoint = LoadExecutable(elf, moduleRange);
+	uint32 entryPoint = LoadExecutable(elf, moduleRange, loadAddress);
 
 	//Find .iopmod section
-	const ELFHEADER& header(elf.GetHeader());
+	const auto& header = elf.GetHeader();
 	const IOPMOD* iopMod = NULL;
 	for(unsigned int i = 0; i < header.nSectHeaderCount; i++)
 	{
-		ELFSECTIONHEADER* sectionHeader(elf.GetSection(i));
+		auto sectionHeader = elf.GetSection(i);
 		if(sectionHeader->nType != IOPMOD_SECTION_ID) continue;
 		iopMod = reinterpret_cast<const IOPMOD*>(elf.GetSectionData(i));
 	}
@@ -658,7 +683,22 @@ int32 CIopBios::LoadModule(CELF& elf, const char* path)
 		//Clear BSS section
 		uint32 dataSectPos = iopMod->textSectionSize;
 		uint32 bssSectPos = iopMod->textSectionSize + iopMod->dataSectionSize;
-		memset(m_ram + moduleRange.first + bssSectPos, 0, iopMod->bssSectionSize);
+		uint32 bssSectSize = iopMod->bssSectionSize;
+		uint32 moduleSize = moduleRange.second - moduleRange.first;
+		if(bssSectSize == 0)
+		{
+			//Some games (Kya: Dark Lineage) seem to not report a proper value for bss size.
+			//Try to compute its value so we can properly clear the section.
+			assert(moduleSize >= bssSectPos);
+			bssSectSize = moduleSize - bssSectPos;
+		}
+		else
+		{
+			//Just make sure that everything checks out
+			uint32 totalSize = bssSectPos + bssSectSize;
+			assert(totalSize == moduleSize);
+		}
+		memset(m_ram + moduleRange.first + bssSectPos, 0, bssSectSize);
 	}
 
 	std::string moduleName = iopMod ? iopMod->moduleName : "";
@@ -721,13 +761,16 @@ int32 CIopBios::UnloadModule(uint32 loadedModuleId)
 	//TODO: Invalidate MIPS analysis range?
 	m_cpu.m_executor->ClearActiveBlocksInRange(loadedModule->start, loadedModule->end, false);
 
-	//TODO: Check return value here.
-	m_sysmem->FreeMemory(loadedModule->start);
+	if(loadedModule->ownsMemory)
+	{
+		//TODO: Check return value here.
+		m_sysmem->FreeMemory(loadedModule->start);
+	}
 	m_loadedModules.Free(loadedModuleId);
 	return loadedModuleId;
 }
 
-int32 CIopBios::StartModule(uint32 loadedModuleId, const char* path, const char* args, uint32 argsLength)
+int32 CIopBios::StartModule(MODULESTARTREQUEST_SOURCE requestSource, uint32 loadedModuleId, const char* path, const char* args, uint32 argsLength)
 {
 	auto loadedModule = m_loadedModules[loadedModuleId];
 	if(loadedModule == nullptr)
@@ -740,11 +783,11 @@ int32 CIopBios::StartModule(uint32 loadedModuleId, const char* path, const char*
 		return loadedModuleId;
 	}
 	assert(loadedModule->state == MODULE_STATE::STOPPED);
-	RequestModuleStart(false, loadedModuleId, path, args, argsLength);
+	RequestModuleStart(requestSource, false, loadedModuleId, path, args, argsLength);
 	return loadedModuleId;
 }
 
-int32 CIopBios::StopModule(uint32 loadedModuleId)
+int32 CIopBios::StopModule(MODULESTARTREQUEST_SOURCE requestSource, uint32 loadedModuleId)
 {
 	auto loadedModule = m_loadedModules[loadedModuleId];
 	if(loadedModule == nullptr)
@@ -765,7 +808,7 @@ int32 CIopBios::StopModule(uint32 loadedModuleId)
 		                         loadedModuleId);
 		return -1;
 	}
-	RequestModuleStart(true, loadedModuleId, "other", nullptr, 0);
+	RequestModuleStart(requestSource, true, loadedModuleId, "other", nullptr, 0);
 	return loadedModuleId;
 }
 
@@ -819,6 +862,9 @@ int32 CIopBios::ReferModuleStatus(uint32 moduleId, uint32 statusPtr)
 
 void CIopBios::ProcessModuleReset(const std::string& imagePath)
 {
+	CLog::GetInstance().Print(LOGNAME, "ProcessModuleReset(%s);\r\n", imagePath.c_str());
+	m_sifCmd->ClearServers();
+
 	unsigned int imageVersion = 1000;
 	bool found = TryGetImageVersionFromPath(imagePath, &imageVersion);
 	if(!found) found = TryGetImageVersionFromContents(imagePath, &imageVersion);
@@ -1112,7 +1158,7 @@ int32 CIopBios::StartThreadArgs(uint32 threadId, uint32 args, uint32 argpPtr)
 	static const auto pushToStack =
 	    [](uint8* dst, uint32& stackAddress, const uint8* src, uint32 size) {
 		    uint32 fixedSize = ((size + 0x3) & ~0x3);
-		    uint32 copyAddress = stackAddress - size;
+		    uint32 copyAddress = stackAddress - fixedSize;
 		    stackAddress -= fixedSize;
 		    memcpy(dst + copyAddress, src, size);
 		    return copyAddress;
@@ -1378,7 +1424,6 @@ uint32 CIopBios::ReferThreadStatus(uint32 threadId, uint32 statusPtr, bool inInt
 	}
 
 	auto threadInfo = reinterpret_cast<THREAD_INFO*>(m_ram + statusPtr);
-	threadInfo->attributes = 0;
 	threadInfo->option = thread->optionData;
 	threadInfo->attributes = thread->attributes;
 	threadInfo->status = threadStatus;
@@ -1836,11 +1881,11 @@ void CIopBios::NotifyVBlankEnd()
 #endif
 }
 
-uint32 CIopBios::CreateSemaphore(uint32 initialCount, uint32 maxCount)
+uint32 CIopBios::CreateSemaphore(uint32 initialCount, uint32 maxCount, uint32 optionData, uint32 attributes)
 {
 #ifdef _DEBUG
-	CLog::GetInstance().Print(LOGNAME, "%i: CreateSemaphore(initialCount = %i, maxCount = %i);\r\n",
-	                          m_currentThreadId.Get(), initialCount, maxCount);
+	CLog::GetInstance().Print(LOGNAME, "%i: CreateSemaphore(initialCount = %i, maxCount = %i, optionData = 0x%08X, attributes = 0x%08X);\r\n",
+	                          m_currentThreadId.Get(), initialCount, maxCount, optionData, attributes);
 #endif
 
 	uint32 semaphoreId = m_semaphores.Allocate();
@@ -1850,12 +1895,13 @@ uint32 CIopBios::CreateSemaphore(uint32 initialCount, uint32 maxCount)
 		return -1;
 	}
 
-	SEMAPHORE* semaphore = m_semaphores[semaphoreId];
-
+	auto semaphore = m_semaphores[semaphoreId];
 	semaphore->count = initialCount;
 	semaphore->maxCount = maxCount;
 	semaphore->id = semaphoreId;
 	semaphore->waitCount = 0;
+	semaphore->attrib = attributes;
+	semaphore->option = optionData;
 
 	return semaphore->id;
 }
@@ -1992,8 +2038,8 @@ uint32 CIopBios::ReferSemaphoreStatus(uint32 semaphoreId, uint32 statusPtr)
 	}
 
 	auto status = reinterpret_cast<SEMAPHORE_STATUS*>(m_ram + statusPtr);
-	status->attrib = 0;
-	status->option = 0;
+	status->attrib = semaphore->attrib;
+	status->option = semaphore->option;
 	status->initCount = 0;
 	status->maxCount = semaphore->maxCount;
 	status->currentCount = semaphore->count;
@@ -2883,7 +2929,6 @@ uint32 CIopBios::AssembleThreadFinish(CMIPSAssembler& assembler)
 uint32 CIopBios::AssembleReturnFromException(CMIPSAssembler& assembler)
 {
 	uint32 address = BIOS_HANDLERS_BASE + assembler.GetProgramSize() * 4;
-	assembler.ADDIU(CMIPS::SP, CMIPS::SP, STACK_FRAME_RESERVE_SIZE);
 	assembler.ADDIU(CMIPS::V0, CMIPS::R0, SYSCALL_RETURNFROMEXCEPTION);
 	assembler.SYSCALL();
 	return address;
@@ -2897,22 +2942,15 @@ uint32 CIopBios::AssembleIdleFunction(CMIPSAssembler& assembler)
 	return address;
 }
 
-uint32 CIopBios::AssembleModuleStarterThreadProc(CMIPSAssembler& assembler)
+uint32 CIopBios::AssembleModuleStarterProc(CMIPSAssembler& assembler)
 {
 	uint32 address = BIOS_HANDLERS_BASE + assembler.GetProgramSize() * 4;
 
-	auto startLabel = assembler.CreateLabel();
-
-	assembler.MarkLabel(startLabel);
-	assembler.ADDIU(CMIPS::V0, CMIPS::R0, SYSCALL_SLEEPTHREAD);
-	assembler.SYSCALL();
 	assembler.ADDIU(CMIPS::V0, CMIPS::R0, SYSCALL_PROCESSMODULESTART);
 	assembler.SYSCALL();
 	assembler.ADDU(CMIPS::A0, CMIPS::V0, CMIPS::R0);
 	assembler.ADDIU(CMIPS::V0, CMIPS::R0, SYSCALL_FINISHMODULESTART);
 	assembler.SYSCALL();
-	assembler.BEQ(CMIPS::R0, CMIPS::R0, startLabel);
-	assembler.NOP();
 
 	return address;
 }
@@ -3124,9 +3162,9 @@ void CIopBios::HandleInterrupt()
 					SaveThreadContext(m_currentThreadId);
 				}
 				m_currentThreadId = -1;
-				INTRHANDLER* handler = m_intrHandlers[handlerId];
+				auto handler = m_intrHandlers[handlerId];
 				m_cpu.m_State.nPC = handler->handler;
-				m_cpu.m_State.nGPR[CMIPS::SP].nD0 -= STACK_FRAME_RESERVE_SIZE;
+				m_cpu.m_State.nGPR[CMIPS::SP].nD0 = (BIOS_INTSTACK_BASE + BIOS_INTSTACK_SIZE) - STACK_FRAME_RESERVE_SIZE;
 				m_cpu.m_State.nGPR[CMIPS::A0].nD0 = static_cast<int32>(handler->arg);
 				m_cpu.m_State.nGPR[CMIPS::RA].nD0 = static_cast<int32>(m_returnFromExceptionAddress);
 			}
@@ -3256,21 +3294,23 @@ bool CIopBios::ReleaseModule(const std::string& moduleName)
 	return true;
 }
 
-uint32 CIopBios::LoadExecutable(CELF& elf, ExecutableRange& executableRange)
+uint32 CIopBios::LoadExecutable(CELF& elf, ExecutableRange& executableRange, uint32 baseAddress)
 {
 	unsigned int programHeaderIndex = GetElfProgramToLoad(elf);
 	if(programHeaderIndex == -1)
 	{
 		throw std::runtime_error("No program to load.");
 	}
-	ELFPROGRAMHEADER* programHeader = elf.GetProgram(programHeaderIndex);
-	uint32 baseAddress = m_sysmem->AllocateMemory(programHeader->nMemorySize, 0, 0);
-	RelocateElf(elf, baseAddress);
-
+	auto programHeader = elf.GetProgram(programHeaderIndex);
+	if(baseAddress == ~0U)
+	{
+		baseAddress = m_sysmem->AllocateMemory(programHeader->nMemorySize, 0, 0);
+	}
 	memcpy(
 	    m_ram + baseAddress,
 	    elf.GetContent() + programHeader->nOffset,
 	    programHeader->nFileSize);
+	RelocateElf(elf, baseAddress, programHeader->nFileSize);
 
 	executableRange.first = baseAddress;
 	executableRange.second = baseAddress + programHeader->nMemorySize;
@@ -3281,11 +3321,11 @@ uint32 CIopBios::LoadExecutable(CELF& elf, ExecutableRange& executableRange)
 unsigned int CIopBios::GetElfProgramToLoad(CELF& elf)
 {
 	unsigned int program = -1;
-	const ELFHEADER& header = elf.GetHeader();
+	const auto& header = elf.GetHeader();
 	for(unsigned int i = 0; i < header.nProgHeaderCount; i++)
 	{
-		ELFPROGRAMHEADER* programHeader = elf.GetProgram(i);
-		if(programHeader != NULL && programHeader->nType == 1)
+		auto programHeader = elf.GetProgram(i);
+		if(programHeader != NULL && programHeader->nType == CELF::PT_LOAD)
 		{
 			if(program != -1)
 			{
@@ -3297,55 +3337,59 @@ unsigned int CIopBios::GetElfProgramToLoad(CELF& elf)
 	return program;
 }
 
-void CIopBios::RelocateElf(CELF& elf, uint32 baseAddress)
+void CIopBios::RelocateElf(CELF& elf, uint32 programBaseAddress, uint32 programSize)
 {
 	//The IOP's ELF loader doesn't seem to follow the ELF standard completely
 	//when it comes to relocations. The relocation function seems to use the
-	//.text section's base address for all adjustments. Using information from the
+	//loaded program's base address for all adjustments. Using information from the
 	//section headers (either the section's start address or info field) will yield
-	//an incorrect result in some cases (ex.: RWA.IRA module from Burnout 3 and Burnout Revenge)
-
+	//an incorrect result in some cases.
+	//Examples:
+	//- RWA.IRX module from Burnout 3 and Burnout Revenge
+	//- Modules from Twinkle Star Sprites (stripped section name string table)
 	const auto& header = elf.GetHeader();
-	uint32 maxRelocAddress =
-	    [&]() {
-		    auto programHeader = elf.GetProgram(1);
-		    if(!programHeader) return UINT32_MAX;
-		    if(programHeader->nType != CELF::PT_LOAD) return UINT32_MAX;
-		    return programHeader->nMemorySize;
-	    }();
 	bool isVersion2 = (header.nType == ET_SCE_IOPRELEXEC2);
-	auto textSectionIndex = elf.FindSectionIndex(".text");
-	assert(textSectionIndex != 0);
-	auto textSection = elf.GetSection(textSectionIndex);
-	auto textSectionData = reinterpret_cast<uint8*>(const_cast<void*>(elf.GetSectionData(textSectionIndex)));
+	auto programData = m_ram + programBaseAddress;
 	for(unsigned int i = 0; i < header.nSectHeaderCount; i++)
 	{
 		const auto* sectionHeader = elf.GetSection(i);
 		if(sectionHeader != nullptr && sectionHeader->nType == CELF::SHT_REL)
 		{
-			uint32 lastHi16 = -1;
+			int32 lastHi16 = -1;
 			uint32 instructionHi16 = -1;
 			unsigned int recordCount = sectionHeader->nSize / 8;
 			auto relocationRecord = reinterpret_cast<const uint32*>(elf.GetSectionData(i));
 			uint32 sectionBase = 0;
 			for(unsigned int record = 0; record < recordCount; record++)
 			{
-				uint32 relocationAddress = relocationRecord[0] - sectionBase;
+				//Helper to make sure we don't read/write things out of the module's memory area
+				uint32 oobInstruction = 0;
+				const auto& getInstructionRef = [&](int32 offset) -> uint32& {
+					if((offset < 0) || (offset >= static_cast<int32>(programSize)))
+					{
+						CLog::GetInstance().Warn(LOGNAME, "Relocation %d accessing location out of bounds: %d.\r\n", record, offset);
+						oobInstruction = 0;
+						return oobInstruction;
+					}
+					return *reinterpret_cast<uint32*>(programData + offset);
+				};
+
+				//Some games have negative relocation addresses (Hitman 2: Silent Assassin)
+				//Doesn't seem to be an issue, but we need offsets to be signed
+				int32 relocationAddress = relocationRecord[0] - sectionBase;
 				uint32 relocationType = relocationRecord[1] & 0xFF;
-				assert(relocationAddress < maxRelocAddress);
-				if(relocationAddress < maxRelocAddress)
 				{
-					uint32& instruction = *reinterpret_cast<uint32*>(&textSectionData[relocationAddress]);
+					uint32& instruction = getInstructionRef(relocationAddress);
 					switch(relocationType)
 					{
 					case CELF::R_MIPS_32:
 					{
-						instruction += baseAddress;
+						instruction += programBaseAddress;
 					}
 					break;
 					case CELF::R_MIPS_26:
 					{
-						uint32 offset = (instruction & 0x03FFFFFF) + (baseAddress >> 2);
+						uint32 offset = (instruction & 0x03FFFFFF) + (programBaseAddress >> 2);
 						instruction &= ~0x03FFFFFF;
 						instruction |= offset;
 					}
@@ -3355,10 +3399,10 @@ void CIopBios::RelocateElf(CELF& elf, uint32 baseAddress)
 						{
 							assert((record + 1) != recordCount);
 							assert((relocationRecord[3] & 0xFF) == CELF::R_MIPS_LO16);
-							uint32 nextRelocationAddress = relocationRecord[2] - sectionBase;
-							uint32 nextInstruction = *reinterpret_cast<uint32*>(&textSectionData[nextRelocationAddress]);
+							int32 nextRelocationAddress = relocationRecord[2] - sectionBase;
+							uint32 nextInstruction = getInstructionRef(nextRelocationAddress);
 							uint32 offset = static_cast<int16>(nextInstruction) + (instruction << 16);
-							offset += baseAddress;
+							offset += programBaseAddress;
 							if(offset & 0x8000) offset += 0x10000;
 							instruction &= ~0xFFFF;
 							instruction |= offset >> 16;
@@ -3374,7 +3418,7 @@ void CIopBios::RelocateElf(CELF& elf, uint32 baseAddress)
 						if(isVersion2)
 						{
 							uint32 offset = static_cast<int16>(instruction);
-							offset += baseAddress;
+							offset += programBaseAddress;
 							instruction &= ~0xFFFF;
 							instruction |= offset & 0xFFFF;
 						}
@@ -3383,11 +3427,11 @@ void CIopBios::RelocateElf(CELF& elf, uint32 baseAddress)
 							assert(lastHi16 != -1);
 
 							uint32 offset = static_cast<int16>(instruction) + (instructionHi16 << 16);
-							offset += baseAddress;
+							offset += programBaseAddress;
 							instruction &= ~0xFFFF;
 							instruction |= offset & 0xFFFF;
 
-							uint32& prevInstruction = *reinterpret_cast<uint32*>(&textSectionData[lastHi16]);
+							uint32& prevInstruction = getInstructionRef(lastHi16);
 							prevInstruction &= ~0xFFFF;
 							if(offset & 0x8000) offset += 0x10000;
 							prevInstruction |= offset >> 16;
@@ -3399,12 +3443,12 @@ void CIopBios::RelocateElf(CELF& elf, uint32 baseAddress)
 						assert(isVersion2);
 						assert((record + 1) != recordCount);
 						assert((relocationRecord[3] & 0xFF) == R_MIPSSCE_ADDEND);
-						uint32 offset = relocationRecord[2] + baseAddress;
+						uint32 offset = relocationRecord[2] + programBaseAddress;
 						if(offset & 0x8000) offset += 0x10000;
 						offset >>= 16;
 						while(1)
 						{
-							uint32& prevInstruction = *reinterpret_cast<uint32*>(&textSectionData[relocationAddress]);
+							uint32& prevInstruction = getInstructionRef(relocationAddress);
 
 							int32 mhiOffset = static_cast<int16>(prevInstruction);
 							mhiOffset *= 4;
@@ -3432,7 +3476,7 @@ void CIopBios::RelocateElf(CELF& elf, uint32 baseAddress)
 	}
 }
 
-void CIopBios::TriggerCallback(uint32 address, uint32 arg0, uint32 arg1, uint32 arg2, uint32 arg3)
+int32 CIopBios::TriggerCallback(uint32 address, uint32 arg0, uint32 arg1, uint32 arg2, uint32 arg3)
 {
 	// Call the addres on a callback thread with A0 set to arg0
 	uint32 callbackThreadId = -1;
@@ -3463,6 +3507,8 @@ void CIopBios::TriggerCallback(uint32 address, uint32 arg0, uint32 arg1, uint32 
 	thread->context.gpr[CMIPS::A1] = arg1;
 	thread->context.gpr[CMIPS::A2] = arg2;
 	thread->context.gpr[CMIPS::A3] = arg3;
+
+	return callbackThreadId;
 }
 
 void CIopBios::PopulateSystemIntcHandlers()
@@ -3669,19 +3715,19 @@ void CIopBios::PrepareModuleDebugInfo(CELF& elf, const ExecutableRange& moduleRa
 
 	//Look also for symbol tables
 	{
-		ELFSECTIONHEADER* pSymTab = elf.FindSection(".symtab");
+		auto pSymTab = elf.FindSection(".symtab");
 		if(pSymTab != NULL)
 		{
 			const char* pStrTab = reinterpret_cast<const char*>(elf.GetSectionData(pSymTab->nIndex));
 			if(pStrTab != NULL)
 			{
-				const ELFSYMBOL* pSym = reinterpret_cast<const ELFSYMBOL*>(elf.FindSectionData(".symtab"));
-				unsigned int nCount = pSymTab->nSize / sizeof(ELFSYMBOL);
+				auto pSym = reinterpret_cast<const CELF::ELFSYMBOL*>(elf.FindSectionData(".symtab"));
+				unsigned int nCount = pSymTab->nSize / sizeof(CELF::ELFSYMBOL);
 
 				for(unsigned int i = 0; i < nCount; i++)
 				{
 					if((pSym[i].nInfo & 0x0F) != 0x02) continue;
-					ELFSECTIONHEADER* symbolSection = elf.GetSection(pSym[i].nSectionIndex);
+					auto symbolSection = elf.GetSection(pSym[i].nSectionIndex);
 					if(symbolSection == NULL) continue;
 					m_cpu.m_Functions.InsertTag(moduleRange.first + symbolSection->nStart + pSym[i].nValue, (char*)pStrTab + pSym[i].nName);
 					functionAdded = true;

@@ -8,6 +8,9 @@
 #include "string_format.h"
 #include "StdStreamUtils.h"
 #include "http/HttpClientFactory.h"
+#ifdef __ANDROID__
+#include "android/ContentUtils.h"
+#endif
 
 //Jobs
 // Scan for new games (from input directory)
@@ -48,6 +51,21 @@ bool IsBootableDiscImagePath(const fs::path& filePath)
 	std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
 	auto extensionIterator = supportedExtensions.find(extension);
 	return extensionIterator != std::end(supportedExtensions);
+}
+
+bool DoesBootableExist(const fs::path& filePath)
+{
+	//TODO: Properly support S3 paths. Also, beware when implementing this because Android
+	//      might complain about network access being done on the main thread.
+	static const char* s3ImagePathPrefix = "//s3/";
+	if(filePath.string().find(s3ImagePathPrefix) == 0) return true;
+#ifdef __ANDROID__
+	if(Framework::Android::CContentUtils::IsContentPath(filePath))
+	{
+		return Framework::Android::CContentUtils::DoesFileExist(filePath);
+	}
+#endif
+	return fs::exists(filePath);
 }
 
 bool TryRegisterBootable(const fs::path& path)
@@ -147,7 +165,7 @@ void PurgeInexistingFiles()
 	auto bootables = BootablesDb::CClient::GetInstance().GetBootables();
 	for(const auto& bootable : bootables)
 	{
-		if(fs::exists(bootable.path)) continue;
+		if(DoesBootableExist(bootable.path)) continue;
 		BootablesDb::CClient::GetInstance().UnregisterBootable(bootable.path);
 	}
 }
@@ -168,9 +186,13 @@ void FetchGameTitles()
 
 	if(serials.empty()) return;
 
+	BootableLog("Fetching info for %d games.\r\n", serials.size());
+
 	try
 	{
 		auto gamesList = TheGamesDb::CClient::GetInstance().GetGames(serials);
+		BootableLog("Received info for %d games.\r\n", gamesList.size());
+
 		for(auto& game : gamesList)
 		{
 			for(const auto& bootable : bootables)
@@ -179,6 +201,8 @@ void FetchGameTitles()
 				{
 					if(discId == bootable.discId)
 					{
+						BootableLog("Setting info for '%s'...\r\n", bootable.discId.c_str());
+
 						BootablesDb::CClient::GetInstance().SetTitle(bootable.path, game.title.c_str());
 
 						if(!game.overview.empty())
@@ -197,8 +221,9 @@ void FetchGameTitles()
 			}
 		}
 	}
-	catch(...)
+	catch(const std::exception& exception)
 	{
+		BootableLog("Caught an exception while trying to fetch titles: %s\r\n", exception.what());
 	}
 }
 
@@ -211,23 +236,48 @@ void FetchGameCovers()
 	std::vector<std::string> serials;
 	for(const auto& bootable : bootables)
 	{
-		if(bootable.discId.empty() || bootable.coverUrl.empty())
+		if(bootable.discId.empty())
 			continue;
 
-		auto path = coverpath / (bootable.discId + ".jpg");
-		if(fs::exists(path))
-			continue;
+		BootableLog("Checking cover for '%s'...\r\n", bootable.discId.c_str());
 
-		auto requestResult =
-		    [&]() {
-			    auto client = Framework::Http::CreateHttpClient();
-			    client->SetUrl(bootable.coverUrl);
-			    return client->SendRequest();
-		    }();
-		if(requestResult.statusCode == Framework::Http::HTTP_STATUS_CODE::OK)
+		if(bootable.coverUrl.empty())
 		{
-			auto outputStream = Framework::CreateOutputStdStream(path.native());
-			outputStream.Write(requestResult.data.GetBuffer(), requestResult.data.GetSize());
+			BootableLog("Bootable has no cover URL, skipping.\r\n");
+			continue;
+		}
+
+		try
+		{
+			auto path = coverpath / (bootable.discId + ".jpg");
+
+			BootableLog("Looking for '%s'... ", path.string().c_str());
+			if(fs::exists(path))
+			{
+				BootableLog("Already exists, skipping.\r\n");
+				continue;
+			}
+			BootableLog("Doesn't exist.\r\n");
+			BootableLog("Downloading from '%s'...\r\n", bootable.coverUrl.c_str());
+
+			auto requestResult =
+			    [&]() {
+				    auto client = Framework::Http::CreateHttpClient();
+				    client->SetUrl(bootable.coverUrl);
+				    return client->SendRequest();
+			    }();
+
+			BootableLog("Download yielded result %d.\r\n", requestResult.statusCode);
+			if(requestResult.statusCode == Framework::Http::HTTP_STATUS_CODE::OK)
+			{
+				auto outputStream = Framework::CreateOutputStdStream(path.native());
+				outputStream.Write(requestResult.data.GetBuffer(), requestResult.data.GetSize());
+				BootableLog("Saved cover to disk.\r\n");
+			}
+		}
+		catch(const std::exception& exception)
+		{
+			BootableLog("Caught an exception while trying to process cover: %s\r\n", exception.what());
 		}
 	}
 }

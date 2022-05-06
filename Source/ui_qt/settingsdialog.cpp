@@ -80,11 +80,13 @@ void SettingsDialog::LoadPreferences()
 {
 	ui->comboBox_system_language->setCurrentIndex(CAppConfig::GetInstance().GetPreferenceInteger(PREF_SYSTEM_LANGUAGE));
 	ui->checkBox_limitFrameRate->setChecked(CAppConfig::GetInstance().GetPreferenceBoolean(PREF_PS2_LIMIT_FRAMERATE));
+	ui->checkBox_showEECPUUsage->setChecked(CAppConfig::GetInstance().GetPreferenceBoolean(PREF_UI_SHOWEECPUUSAGE));
 
 	int factor = CAppConfig::GetInstance().GetPreferenceInteger(PREF_CGSH_OPENGL_RESOLUTION_FACTOR);
 	int factor_index = std::log2(factor);
 	ui->comboBox_res_multiplyer->setCurrentIndex(factor_index);
 	ui->checkBox_widescreenOutput->setChecked(CAppConfig::GetInstance().GetPreferenceBoolean(PREF_CGSHANDLER_WIDESCREEN));
+	ui->checkBox_enable_gs_ram_reads->setChecked(CAppConfig::GetInstance().GetPreferenceBoolean(PREF_CGSHANDLER_GS_RAM_READS_ENABLED));
 	ui->checkBox_force_bilinear_filtering->setChecked(CAppConfig::GetInstance().GetPreferenceBoolean(PREF_CGSH_OPENGL_FORCEBILINEARTEXTURES));
 	ui->comboBox_gs_selection->setCurrentIndex(CAppConfig::GetInstance().GetPreferenceInteger(PREF_VIDEO_GS_HANDLER));
 
@@ -105,11 +107,21 @@ void SettingsDialog::on_checkBox_limitFrameRate_clicked(bool checked)
 	CAppConfig::GetInstance().SetPreferenceBoolean(PREF_PS2_LIMIT_FRAMERATE, checked);
 }
 
+void SettingsDialog::on_checkBox_showEECPUUsage_clicked(bool checked)
+{
+	CAppConfig::GetInstance().SetPreferenceBoolean(PREF_UI_SHOWEECPUUSAGE, checked);
+}
+
 //Video Page ---------------------------------
 
 void SettingsDialog::on_checkBox_widescreenOutput_clicked(bool checked)
 {
 	CAppConfig::GetInstance().SetPreferenceBoolean(PREF_CGSHANDLER_WIDESCREEN, checked);
+}
+
+void SettingsDialog::on_checkBox_enable_gs_ram_reads_clicked(bool checked)
+{
+	CAppConfig::GetInstance().SetPreferenceBoolean(PREF_CGSHANDLER_GS_RAM_READS_ENABLED, checked);
 }
 
 void SettingsDialog::on_checkBox_force_bilinear_filtering_clicked(bool checked)

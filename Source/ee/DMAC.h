@@ -100,6 +100,13 @@ public:
 		ENABLE_CPND = 0x10000,
 	};
 
+	enum WRITE_MASKS
+	{
+		MADR_WRITE_MASK = ~(0x0000000FU),
+		QWC_WRITE_MASK = ~(0xFFFF0000U),
+		SPR_MADR_WRITE_MASK = ~(0x8000000FU),
+	};
+
 	CDMAC(uint8*, uint8*, uint8*, CMIPS&);
 	virtual ~CDMAC() = default;
 
@@ -116,7 +123,7 @@ public:
 	void DisassembleGet(uint32);
 	void DisassembleSet(uint32, uint32);
 
-	bool IsInterruptPending();
+	bool IsInterruptPending() const;
 	void ResumeDMA0();
 	void ResumeDMA1();
 	void ResumeDMA2();
@@ -125,8 +132,30 @@ public:
 	void ResumeDMA8();
 	bool IsDMA4Started() const;
 	static bool IsEndSrcTagId(uint32);
+	static bool IsEndDstTagId(uint32);
 
 private:
+	enum D_CTRL_STS
+	{
+		D_CTRL_STS_NONE = 0,
+		D_CTRL_STS_SIF0 = 1,
+		D_CTRL_STS_FROM_SPR = 2,
+		D_CTRL_STS_FROM_IPU = 3,
+	};
+
+	enum D_CTRL_STD
+	{
+		D_CTRL_STD_NONE = 0,
+		D_CTRL_STD_VIF1 = 1,
+		D_CTRL_STD_GIF = 2,
+		D_CTRL_STD_SIF1 = 3,
+	};
+
+	enum D_STAT_BITS
+	{
+		D_STAT_MEIS = (1 << 14),
+	};
+
 	struct D_CTRL_REG : public convertible<uint32>
 	{
 		unsigned int dmae : 1;

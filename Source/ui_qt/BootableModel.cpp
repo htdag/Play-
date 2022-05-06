@@ -31,7 +31,7 @@ QVariant BootableModel::data(const QModelIndex& index, int role) const
 	{
 		int pos = index.row() + index.column();
 		auto bootable = m_bootables.at(static_cast<unsigned int>(pos));
-		return QVariant::fromValue(BootableCoverQVarient(bootable.discId, bootable.title));
+		return QVariant::fromValue(BootableCoverQVariant(bootable.discId, bootable.title, bootable.path.string(), bootable.states));
 	}
 	return QVariant();
 }
@@ -69,13 +69,22 @@ void BootableModel::SetWidth(int width)
 }
 
 /* start of BootImageItemDelegate */
-BootableCoverQVarient::BootableCoverQVarient(std::string key, std::string title)
+BootableCoverQVariant::BootableCoverQVariant(std::string key, std::string title, std::string path, BootablesDb::BootableStateList states)
     : m_key(key)
     , m_title(title)
+    , m_path(path)
+    , m_states(states)
 {
+	for(auto state : states)
+	{
+		if(state.name.find("state") != std::string::npos)
+		{
+			m_statusColor = "#" + state.color;
+		}
+	}
 }
 
-void BootableCoverQVarient::paint(QPainter* painter, const QRect& rect, const QPalette&, int) const
+void BootableCoverQVariant::paint(QPainter* painter, const QRect& rect, const QPalette&, int) const
 {
 	painter->save();
 
@@ -100,12 +109,26 @@ void BootableCoverQVarient::paint(QPainter* painter, const QRect& rect, const QP
 		text += m_title;
 		painter.drawText(pix_rect, text.c_str(), opts);
 	}
+
+	if(!m_statusColor.empty())
+	{
+		QPainter painter(&pixmap);
+		auto radius = pixmap.height() - (pixmap.height() * 92.5 / 100);
+		QRect pix_rect = QRect(pixmap.width() - radius - 5, pixmap.height() - radius - 5, radius, radius);
+
+		QColor color(m_statusColor.c_str());
+		Qt::BrushStyle style = Qt::SolidPattern;
+		QBrush brush(color, style);
+		painter.setBrush(brush);
+		painter.drawEllipse(pix_rect);
+	}
+
 	painter->drawPixmap(rect.x() + 5 + (GetPadding() / 2), rect.y() + 5, pixmap);
 
 	painter->restore();
 }
 
-int BootableCoverQVarient::GetPadding() const
+int BootableCoverQVariant::GetPadding() const
 {
 	QPixmap pixmap = CoverUtils::find("PH");
 	int cover_width = pixmap.size().width() + 10;
@@ -118,7 +141,7 @@ int BootableCoverQVarient::GetPadding() const
 	return 0;
 }
 
-QSize BootableCoverQVarient::sizeHint() const
+QSize BootableCoverQVariant::sizeHint() const
 {
 	QSize size;
 	if(size.isEmpty())
@@ -133,6 +156,29 @@ QSize BootableCoverQVarient::sizeHint() const
 	return size;
 }
 
+std::string BootableCoverQVariant::GetKey()
+{
+	return m_key;
+}
+
+std::string BootableCoverQVariant::GetTitle()
+{
+	return m_title;
+}
+
+std::string BootableCoverQVariant::GetPath()
+{
+	return m_path;
+}
+
+bool BootableCoverQVariant::HasState(std::string state)
+{
+	auto itr = std::find_if(std::begin(m_states), std::end(m_states), [state](BootablesDb::BootableState bootState) {
+		return bootState.name == state;
+	});
+	return itr != std::end(m_states);
+}
+
 /* start of BootImageItemDelegate */
 BootImageItemDelegate::BootImageItemDelegate(QWidget* parent)
     : QStyledItemDelegate(parent)
@@ -141,9 +187,9 @@ BootImageItemDelegate::BootImageItemDelegate(QWidget* parent)
 
 void BootImageItemDelegate::paint(QPainter* painter, const QStyleOptionViewItem& option, const QModelIndex& index) const
 {
-	if(index.data().canConvert<BootableCoverQVarient>())
+	if(index.data().canConvert<BootableCoverQVariant>())
 	{
-		BootableCoverQVarient bootablecover = qvariant_cast<BootableCoverQVarient>(index.data());
+		BootableCoverQVariant bootablecover = qvariant_cast<BootableCoverQVariant>(index.data());
 
 		if(option.state & QStyle::State_Selected)
 			painter->fillRect(option.rect, option.palette.highlight());
@@ -158,9 +204,9 @@ void BootImageItemDelegate::paint(QPainter* painter, const QStyleOptionViewItem&
 
 QSize BootImageItemDelegate::sizeHint(const QStyleOptionViewItem& option, const QModelIndex& index) const
 {
-	if(index.data().canConvert<BootableCoverQVarient>())
+	if(index.data().canConvert<BootableCoverQVariant>())
 	{
-		BootableCoverQVarient bootablecover = qvariant_cast<BootableCoverQVarient>(index.data());
+		BootableCoverQVariant bootablecover = qvariant_cast<BootableCoverQVariant>(index.data());
 		return bootablecover.sizeHint();
 	}
 	else

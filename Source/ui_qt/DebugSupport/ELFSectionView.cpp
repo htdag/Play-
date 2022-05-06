@@ -96,7 +96,7 @@ void CELFSectionView::FillInformation(int section)
 {
 	int i = 0;
 	std::string sTemp;
-	ELFSECTIONHEADER* pH = m_pELF->GetSection(section);
+	auto pH = m_pELF->GetSection(section);
 
 	switch(pH->nType)
 	{
@@ -140,15 +140,15 @@ void CELFSectionView::FillInformation(int section)
 	if(pH->nFlags & 0x7)
 	{
 		sTemp += " (";
-		if(pH->nFlags & 0x01)
+		if(pH->nFlags & CELF::SHF_WRITE)
 		{
 			sTemp += "SHF_WRITE";
-			if(pH->nFlags & 0x6)
+			if(pH->nFlags & 0x06)
 			{
 				sTemp += " | ";
 			}
 		}
-		if(pH->nFlags & 0x2)
+		if(pH->nFlags & CELF::SHF_ALLOC)
 		{
 			sTemp += "SHF_ALLOC";
 			if(pH->nFlags & 0x04)
@@ -156,7 +156,7 @@ void CELFSectionView::FillInformation(int section)
 				sTemp += " | ";
 			}
 		}
-		if(pH->nFlags & 0x04)
+		if(pH->nFlags & CELF::SHF_EXECINSTR)
 		{
 			sTemp += "SHF_EXECINSTR";
 		}
@@ -214,7 +214,7 @@ void CELFSectionView::FillDynamicSectionListView(int section)
 {
 	m_dynSecTableWidget->setRowCount(0);
 
-	const ELFSECTIONHEADER* pH = m_pELF->GetSection(section);
+	auto pH = m_pELF->GetSection(section);
 	const uint32* dynamicData = reinterpret_cast<const uint32*>(m_pELF->GetSectionData(section));
 	const char* stringTable = (pH->nOther != -1) ? reinterpret_cast<const char*>(m_pELF->GetSectionData(pH->nIndex)) : NULL;
 

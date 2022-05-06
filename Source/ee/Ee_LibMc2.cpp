@@ -1,13 +1,21 @@
-#include <cassert>
 #include "Ee_LibMc2.h"
+#include <cassert>
+#include "zip/ZipArchiveWriter.h"
+#include "zip/ZipArchiveReader.h"
 #include "Ps2Const.h"
 #include "Log.h"
-#include "../iop/IopBios.h"
+#include "PS2OS.h"
 #include "../iop/Iop_McServ.h"
 
 using namespace Ee;
 
 #define LOG_NAME "ee_libmc2"
+
+#define STATE_XML ("libmc2/state.xml")
+#define STATE_LAST_CMD ("lastCmd")
+#define STATE_LAST_RESULT ("lastResult")
+#define STATE_WAIT_THREADID ("waitThreadId")
+#define STATE_WAIT_VBLANK_COUNT ("waitVBlankCount")
 
 #define MC_PORT 0
 
@@ -19,15 +27,43 @@ using namespace Ee;
 #define MC2_RESULT_OK 0
 #define MC2_RESULT_ERROR_NOT_FOUND 0x81010002
 
-CLibMc2::CLibMc2(uint8* ram, CIopBios& iopBios)
+CLibMc2::CLibMc2(uint8* ram, CPS2OS& eeBios, CIopBios& iopBios)
     : m_ram(ram)
+    , m_eeBios(eeBios)
     , m_iopBios(iopBios)
 {
 	m_moduleLoadedConnection = m_iopBios.OnModuleLoaded.Connect(
 	    [this](const char* moduleName) { OnIopModuleLoaded(moduleName); });
 }
 
-uint32 CLibMc2::AnalyzeFunction(uint32 startAddress, int16 stackAlloc)
+void CLibMc2::Reset()
+{
+	m_lastCmd = 0;
+	m_lastResult = 0;
+	m_waitThreadId = WAIT_THREAD_ID_EMPTY;
+	m_waitVBlankCount = 0;
+}
+
+void CLibMc2::SaveState(Framework::CZipArchiveWriter& archive)
+{
+	auto registerFile = new CRegisterStateFile(STATE_XML);
+	registerFile->SetRegister32(STATE_LAST_CMD, m_lastCmd);
+	registerFile->SetRegister32(STATE_LAST_RESULT, m_lastResult);
+	registerFile->SetRegister32(STATE_WAIT_THREADID, m_waitThreadId);
+	registerFile->SetRegister32(STATE_WAIT_VBLANK_COUNT, m_waitVBlankCount);
+	archive.InsertFile(registerFile);
+}
+
+void CLibMc2::LoadState(Framework::CZipArchiveReader& archive)
+{
+	auto registerFile = CRegisterStateFile(*archive.BeginReadFile(STATE_XML));
+	m_lastCmd = registerFile.GetRegister32(STATE_LAST_CMD);
+	m_lastResult = registerFile.GetRegister32(STATE_LAST_RESULT);
+	m_waitThreadId = registerFile.GetRegister32(STATE_WAIT_THREADID);
+	m_waitVBlankCount = registerFile.GetRegister32(STATE_WAIT_VBLANK_COUNT);
+}
+
+uint32 CLibMc2::AnalyzeFunction(MODULE_FUNCTIONS& moduleFunctions, uint32 startAddress, int16 stackAlloc)
 {
 	static const uint32 maxFunctionSize = 0x200;
 	bool completed = false;
@@ -93,45 +129,48 @@ uint32 CLibMc2::AnalyzeFunction(uint32 startAddress, int16 stackAlloc)
 			switch(constantsLoaded[0])
 			{
 			case 0x02:
-				m_getInfoAsyncPtr = startAddress;
+				moduleFunctions.getInfoAsyncPtr = startAddress;
 				break;
 			case 0x05:
-				m_readFileAsyncPtr = startAddress;
+				moduleFunctions.readFileAsyncPtr = startAddress;
 				break;
 			case 0x06:
-				m_writeFileAsyncPtr = startAddress;
+				moduleFunctions.writeFileAsyncPtr = startAddress;
 				break;
 			case 0x07:
-				m_createFileAsyncPtr = startAddress;
+				moduleFunctions.createFileAsyncPtr = startAddress;
 				break;
 			case 0x08:
-				m_deleteAsyncPtr = startAddress;
+				moduleFunctions.deleteAsyncPtr = startAddress;
 				break;
 			case 0x0A:
 				if(stackAlloc < 0x100)
 				{
 					//Mana Khemia 2 has 2 potential functions that matches,
 					//we use the stack alloc to make sure we get the right one
-					m_getDirAsyncPtr = startAddress;
+					moduleFunctions.getDirAsyncPtr = startAddress;
 				}
 				break;
 			case 0x0B:
-				m_mkDirAsyncPtr = startAddress;
+				moduleFunctions.mkDirAsyncPtr = startAddress;
 				break;
 			case 0x0C:
-				m_chDirAsyncPtr = startAddress;
+				moduleFunctions.chDirAsyncPtr = startAddress;
 				break;
 			case 0x0D:
-				m_chModAsyncPtr = startAddress;
+				moduleFunctions.chModAsyncPtr = startAddress;
 				break;
 			case 0x0E:
-				m_searchFileAsyncPtr = startAddress;
+				moduleFunctions.searchFileAsyncPtr = startAddress;
+				break;
+			case 0x0F:
+				moduleFunctions.getEntSpaceAsyncPtr = startAddress;
 				break;
 			case 0x20:
-				m_readFile2AsyncPtr = startAddress;
+				moduleFunctions.readFile2AsyncPtr = startAddress;
 				break;
 			case 0x21:
-				m_writeFile2AsyncPtr = startAddress;
+				moduleFunctions.writeFile2AsyncPtr = startAddress;
 				break;
 			}
 		}
@@ -142,8 +181,12 @@ uint32 CLibMc2::AnalyzeFunction(uint32 startAddress, int16 stackAlloc)
 			uint32 pollSemaCount = (syscallsUsed.find(POLLSEMA_SYSCALL) != std::end(syscallsUsed) ? syscallsUsed[POLLSEMA_SYSCALL] : 0);
 			if((waitSemaCount == 1) && (pollSemaCount == 1))
 			{
-				m_checkAsyncPtr = startAddress;
+				moduleFunctions.checkAsyncPtr = startAddress;
 			}
+		}
+		if((countLUI8101 == 3) && (jalCount == 2) && (syscallsUsed.size() == 0) && (constantsLoaded.size() == 0))
+		{
+			moduleFunctions.getDbcStatusPtr = startAddress;
 		}
 		return address;
 	}
@@ -163,6 +206,8 @@ void CLibMc2::OnIopModuleLoaded(const char* moduleName)
 
 void CLibMc2::HookLibMc2Functions()
 {
+	MODULE_FUNCTIONS moduleFunctions;
+
 	for(uint32 address = 0; address < PS2::EE_RAM_SIZE; address += 4)
 	{
 		uint32 opcode = *reinterpret_cast<uint32*>(m_ram + address);
@@ -173,24 +218,26 @@ void CLibMc2::HookLibMc2Functions()
 			if(offset < 0)
 			{
 				//Might be a function start
-				address = AnalyzeFunction(address, -offset);
+				address = AnalyzeFunction(moduleFunctions, address, -offset);
 			}
 		}
 	}
 
-	WriteSyscall(m_getInfoAsyncPtr, SYSCALL_MC2_GETINFO_ASYNC);
-	WriteSyscall(m_readFileAsyncPtr, SYSCALL_MC2_READFILE_ASYNC);
-	WriteSyscall(m_writeFileAsyncPtr, SYSCALL_MC2_WRITEFILE_ASYNC);
-	WriteSyscall(m_createFileAsyncPtr, SYSCALL_MC2_CREATEFILE_ASYNC);
-	WriteSyscall(m_deleteAsyncPtr, SYSCALL_MC2_DELETE_ASYNC);
-	WriteSyscall(m_getDirAsyncPtr, SYSCALL_MC2_GETDIR_ASYNC);
-	WriteSyscall(m_mkDirAsyncPtr, SYSCALL_MC2_MKDIR_ASYNC);
-	WriteSyscall(m_chDirAsyncPtr, SYSCALL_MC2_CHDIR_ASYNC);
-	WriteSyscall(m_chModAsyncPtr, SYSCALL_MC2_CHMOD_ASYNC);
-	WriteSyscall(m_searchFileAsyncPtr, SYSCALL_MC2_SEARCHFILE_ASYNC);
-	WriteSyscall(m_readFile2AsyncPtr, SYSCALL_MC2_READFILE2_ASYNC);
-	WriteSyscall(m_writeFile2AsyncPtr, SYSCALL_MC2_WRITEFILE2_ASYNC);
-	WriteSyscall(m_checkAsyncPtr, SYSCALL_MC2_CHECKASYNC);
+	WriteSyscall(moduleFunctions.getInfoAsyncPtr, SYSCALL_MC2_GETINFO_ASYNC);
+	WriteSyscall(moduleFunctions.readFileAsyncPtr, SYSCALL_MC2_READFILE_ASYNC);
+	WriteSyscall(moduleFunctions.writeFileAsyncPtr, SYSCALL_MC2_WRITEFILE_ASYNC);
+	WriteSyscall(moduleFunctions.createFileAsyncPtr, SYSCALL_MC2_CREATEFILE_ASYNC);
+	WriteSyscall(moduleFunctions.deleteAsyncPtr, SYSCALL_MC2_DELETE_ASYNC);
+	WriteSyscall(moduleFunctions.getDirAsyncPtr, SYSCALL_MC2_GETDIR_ASYNC);
+	WriteSyscall(moduleFunctions.mkDirAsyncPtr, SYSCALL_MC2_MKDIR_ASYNC);
+	WriteSyscall(moduleFunctions.chDirAsyncPtr, SYSCALL_MC2_CHDIR_ASYNC);
+	WriteSyscall(moduleFunctions.chModAsyncPtr, SYSCALL_MC2_CHMOD_ASYNC);
+	WriteSyscall(moduleFunctions.searchFileAsyncPtr, SYSCALL_MC2_SEARCHFILE_ASYNC);
+	WriteSyscall(moduleFunctions.getEntSpaceAsyncPtr, SYSCALL_MC2_GETENTSPACE_ASYNC);
+	WriteSyscall(moduleFunctions.readFile2AsyncPtr, SYSCALL_MC2_READFILE2_ASYNC);
+	WriteSyscall(moduleFunctions.writeFile2AsyncPtr, SYSCALL_MC2_WRITEFILE2_ASYNC);
+	WriteSyscall(moduleFunctions.checkAsyncPtr, SYSCALL_MC2_CHECKASYNC);
+	WriteSyscall(moduleFunctions.getDbcStatusPtr, SYSCALL_MC2_GETDBCSTATUS);
 }
 
 void CLibMc2::WriteSyscall(uint32 address, uint16 syscallNumber)
@@ -201,10 +248,12 @@ void CLibMc2::WriteSyscall(uint32 address, uint16 syscallNumber)
 		return;
 	}
 
-	*reinterpret_cast<uint32*>(m_ram + address + 0x0) = 0x24030000 | syscallNumber;
-	*reinterpret_cast<uint32*>(m_ram + address + 0x4) = 0x0000000C;
-	*reinterpret_cast<uint32*>(m_ram + address + 0x8) = 0x03E00008;
-	*reinterpret_cast<uint32*>(m_ram + address + 0xC) = 0x00000000;
+	CMIPSAssembler assembler(reinterpret_cast<uint32*>(m_ram + address));
+
+	assembler.ADDIU(CMIPS::V1, CMIPS::R0, syscallNumber);
+	assembler.SYSCALL();
+	assembler.JR(CMIPS::RA);
+	assembler.NOP();
 }
 
 const char* CLibMc2::GetSysCallDescription(uint16 syscallNumber)
@@ -233,10 +282,14 @@ const char* CLibMc2::GetSysCallDescription(uint16 syscallNumber)
 		return "ChModAsync";
 	case SYSCALL_MC2_SEARCHFILE_ASYNC:
 		return "SearchFileAsync";
+	case SYSCALL_MC2_GETENTSPACE_ASYNC:
+		return "GetEntSpaceAsync";
 	case SYSCALL_MC2_READFILE2_ASYNC:
 		return "ReadFile2Async";
 	case SYSCALL_MC2_WRITEFILE2_ASYNC:
 		return "WriteFile2Async";
+	case SYSCALL_MC2_GETDBCSTATUS:
+		return "GetDbcStatus";
 	default:
 		return "unknown";
 		break;
@@ -248,10 +301,7 @@ void CLibMc2::HandleSyscall(CMIPS& ee)
 	switch(ee.m_State.nGPR[CMIPS::V1].nV0)
 	{
 	case SYSCALL_MC2_CHECKASYNC:
-		ee.m_State.nGPR[CMIPS::V0].nD0 = CheckAsync(
-		    ee.m_State.nGPR[CMIPS::A0].nV0,
-		    ee.m_State.nGPR[CMIPS::A1].nV0,
-		    ee.m_State.nGPR[CMIPS::A2].nV0);
+		CheckAsync(ee);
 		break;
 	case SYSCALL_MC2_GETINFO_ASYNC:
 		ee.m_State.nGPR[CMIPS::V0].nD0 = GetInfoAsync(
@@ -318,9 +368,33 @@ void CLibMc2::HandleSyscall(CMIPS& ee)
 		    ee.m_State.nGPR[CMIPS::A1].nV0,
 		    ee.m_State.nGPR[CMIPS::A2].nV0);
 		break;
+	case SYSCALL_MC2_GETENTSPACE_ASYNC:
+		ee.m_State.nGPR[CMIPS::V0].nD0 = GetEntSpaceAsync(
+		    ee.m_State.nGPR[CMIPS::A0].nV0,
+		    ee.m_State.nGPR[CMIPS::A1].nV0);
+		break;
+	case SYSCALL_MC2_GETDBCSTATUS:
+		ee.m_State.nGPR[CMIPS::V0].nD0 = GetDbcStatus(
+		    ee.m_State.nGPR[CMIPS::A0].nV0,
+		    ee.m_State.nGPR[CMIPS::A1].nV0);
+		break;
 	default:
 		assert(false);
 		break;
+	}
+}
+
+void CLibMc2::NotifyVBlankStart()
+{
+	if(m_waitThreadId != WAIT_THREAD_ID_EMPTY)
+	{
+		assert(m_waitVBlankCount != 0);
+		m_waitVBlankCount--;
+		if(m_waitVBlankCount == 0)
+		{
+			m_eeBios.ResumeThread(m_waitThreadId);
+			m_waitThreadId = WAIT_THREAD_ID_EMPTY;
+		}
 	}
 }
 
@@ -343,8 +417,12 @@ static void CopyDirParam(CLibMc2::DIRPARAM* dst, const Iop::CMcServ::ENTRY* src)
 	CopyDirParamTime(&dst->modificationDate, &src->modificationTime);
 }
 
-int32 CLibMc2::CheckAsync(uint32 mode, uint32 cmdPtr, uint32 resultPtr)
+void CLibMc2::CheckAsync(CMIPS& context)
 {
+	uint32 mode = context.m_State.nGPR[CMIPS::A0].nV0;
+	uint32 cmdPtr = context.m_State.nGPR[CMIPS::A1].nV0;
+	uint32 resultPtr = context.m_State.nGPR[CMIPS::A2].nV0;
+
 	CLog::GetInstance().Print(LOG_NAME, "CheckAsync(mode = %d, cmdPtr = 0x%08X, resultPtr = 0x%08X);\r\n",
 	                          mode, cmdPtr, resultPtr);
 
@@ -354,17 +432,37 @@ int32 CLibMc2::CheckAsync(uint32 mode, uint32 cmdPtr, uint32 resultPtr)
 	//Returns -1 if no function was executing
 	uint32 result = (m_lastCmd != 0) ? 1 : -1;
 
-	*reinterpret_cast<uint32*>(m_ram + cmdPtr) = m_lastCmd;
-	*reinterpret_cast<uint32*>(m_ram + resultPtr) = m_lastResult;
+	//Don't report last cmd result if we didn't execute a command
+	uint32 lastCmdResult = (m_lastCmd != 0) ? m_lastResult : 0;
+
+	if(cmdPtr != 0)
+	{
+		*reinterpret_cast<uint32*>(m_eeBios.GetStructPtr(cmdPtr)) = m_lastCmd;
+	}
+	if(resultPtr != 0)
+	{
+		*reinterpret_cast<uint32*>(m_eeBios.GetStructPtr(resultPtr)) = lastCmdResult;
+	}
 
 	m_lastCmd = 0;
 
-	return result;
+	context.m_State.nGPR[CMIPS::V0].nD0 = static_cast<int32>(result);
+
+	//Mode:
+	//0 -> Sync (use WaitSema)
+	//1 -> Async (use PollSema)
+	if(mode == 0)
+	{
+		//In Sync Mode, sleep thread for a few vblanks
+		assert(m_waitThreadId == WAIT_THREAD_ID_EMPTY);
+		m_waitVBlankCount = WAIT_VBLANK_INIT_COUNT;
+		m_waitThreadId = m_eeBios.SuspendCurrentThread();
+	}
 }
 
 int32 CLibMc2::GetInfoAsync(uint32 socketId, uint32 infoPtr)
 {
-	auto info = reinterpret_cast<CARDINFO*>(m_ram + infoPtr);
+	auto info = reinterpret_cast<CARDINFO*>(m_eeBios.GetStructPtr(infoPtr));
 
 	CLog::GetInstance().Print(LOG_NAME, "GetInfoAsync(socketId = %d, infoPtr = 0x%08X);\r\n",
 	                          socketId, infoPtr);
@@ -382,7 +480,7 @@ int32 CLibMc2::GetInfoAsync(uint32 socketId, uint32 infoPtr)
 
 int32 CLibMc2::CreateFileAsync(uint32 socketId, uint32 pathPtr)
 {
-	auto path = reinterpret_cast<const char*>(m_ram + pathPtr);
+	auto path = reinterpret_cast<const char*>(m_eeBios.GetStructPtr(pathPtr));
 
 	CLog::GetInstance().Print(LOG_NAME, "CreateFileAsync(socketId = %d, path = '%s');\r\n",
 	                          socketId, path);
@@ -423,7 +521,7 @@ int32 CLibMc2::CreateFileAsync(uint32 socketId, uint32 pathPtr)
 
 int32 CLibMc2::DeleteAsync(uint32 socketId, uint32 pathPtr)
 {
-	auto path = reinterpret_cast<const char*>(m_ram + pathPtr);
+	auto path = reinterpret_cast<const char*>(m_eeBios.GetStructPtr(pathPtr));
 
 	CLog::GetInstance().Print(LOG_NAME, "DeleteAsync(socketId = %d, path = '%s');\r\n",
 	                          socketId, path);
@@ -460,8 +558,8 @@ int32 CLibMc2::GetDirAsync(uint32 socketId, uint32 pathPtr, uint32 offset, int32
 {
 	assert((maxEntries >= 0) || (offset == 0));
 
-	auto path = reinterpret_cast<const char*>(m_ram + pathPtr);
-	auto dirEntries = reinterpret_cast<DIRPARAM*>(m_ram + dirEntriesPtr);
+	auto path = reinterpret_cast<const char*>(m_eeBios.GetStructPtr(pathPtr));
+	auto dirEntries = reinterpret_cast<DIRPARAM*>(m_eeBios.GetStructPtr(dirEntriesPtr));
 
 	CLog::GetInstance().Print(LOG_NAME, "GetDirAsync(socketId = %d, path = '%s', offset = %d, maxEntries = %d, dirEntriesPtr = 0x%08X, countPtr = 0x%08X);\r\n",
 	                          socketId, path, offset, maxEntries, dirEntriesPtr, countPtr);
@@ -494,12 +592,12 @@ int32 CLibMc2::GetDirAsync(uint32 socketId, uint32 pathPtr, uint32 offset, int32
 		if(maxEntries < 0)
 		{
 			//Wanted to get the total amount of entries
-			*reinterpret_cast<uint32*>(m_ram + countPtr) = result;
+			*reinterpret_cast<uint32*>(m_eeBios.GetStructPtr(countPtr)) = result;
 		}
 		else
 		{
 			assert(result >= offset);
-			*reinterpret_cast<uint32*>(m_ram + countPtr) = result - offset;
+			*reinterpret_cast<uint32*>(m_eeBios.GetStructPtr(countPtr)) = result - offset;
 
 			auto dirParam = dirEntries;
 			for(uint32 i = offset; i < result; i++)
@@ -520,7 +618,7 @@ int32 CLibMc2::GetDirAsync(uint32 socketId, uint32 pathPtr, uint32 offset, int32
 
 int32 CLibMc2::MkDirAsync(uint32 socketId, uint32 pathPtr)
 {
-	auto path = reinterpret_cast<const char*>(m_ram + pathPtr);
+	auto path = reinterpret_cast<const char*>(m_eeBios.GetStructPtr(pathPtr));
 
 	CLog::GetInstance().Print(LOG_NAME, "MkDirAsync(socketId = %d, path = '%s');\r\n",
 	                          socketId, path);
@@ -547,7 +645,7 @@ int32 CLibMc2::MkDirAsync(uint32 socketId, uint32 pathPtr)
 
 int32 CLibMc2::ChDirAsync(uint32 socketId, uint32 pathPtr, uint32 pwdPtr)
 {
-	auto path = reinterpret_cast<const char*>(m_ram + pathPtr);
+	auto path = reinterpret_cast<const char*>(m_eeBios.GetStructPtr(pathPtr));
 	assert(pwdPtr == 0);
 
 	CLog::GetInstance().Print(LOG_NAME, "ChDirAsync(socketId = %d, path = '%s', pwdPtr = 0x%08X);\r\n",
@@ -580,7 +678,7 @@ int32 CLibMc2::ChDirAsync(uint32 socketId, uint32 pathPtr, uint32 pwdPtr)
 
 int32 CLibMc2::ChModAsync(uint32 socketId, uint32 pathPtr, uint32 mode)
 {
-	auto path = reinterpret_cast<const char*>(m_ram + pathPtr);
+	auto path = reinterpret_cast<const char*>(m_eeBios.GetStructPtr(pathPtr));
 
 	CLog::GetInstance().Print(LOG_NAME, "ChModAsync(socketId = %d, path = '%s', mode = %d);\r\n",
 	                          socketId, path, mode);
@@ -593,8 +691,8 @@ int32 CLibMc2::ChModAsync(uint32 socketId, uint32 pathPtr, uint32 mode)
 
 int32 CLibMc2::SearchFileAsync(uint32 socketId, uint32 pathPtr, uint32 dirParamPtr)
 {
-	auto path = reinterpret_cast<const char*>(m_ram + pathPtr);
-	auto dirParam = reinterpret_cast<DIRPARAM*>(m_ram + dirParamPtr);
+	auto path = reinterpret_cast<const char*>(m_eeBios.GetStructPtr(pathPtr));
+	auto dirParam = reinterpret_cast<DIRPARAM*>(m_eeBios.GetStructPtr(dirParamPtr));
 
 	CLog::GetInstance().Print(LOG_NAME, "SearchFileAsync(socketId = %d, path = '%s', dirParamPtr = 0x%08X);\r\n",
 	                          socketId, path, dirParamPtr);
@@ -635,9 +733,50 @@ int32 CLibMc2::SearchFileAsync(uint32 socketId, uint32 pathPtr, uint32 dirParamP
 	return 0;
 }
 
+int32 CLibMc2::GetEntSpaceAsync(uint32 socketId, uint32 pathPtr)
+{
+	auto path = reinterpret_cast<const char*>(m_eeBios.GetStructPtr(pathPtr));
+
+	CLog::GetInstance().Print(LOG_NAME, "GetEntSpaceAsync(socketId = %d, path = '%s');\r\n",
+	                          socketId, path);
+
+	auto mcServ = m_iopBios.GetMcServ();
+
+	int32 result = 0;
+	Iop::CMcServ::CMD cmd;
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.port = MC_PORT;
+	assert(strlen(path) <= sizeof(cmd.name));
+	strncpy(cmd.name, path, sizeof(cmd.name));
+
+	mcServ->Invoke(Iop::CMcServ::CMD_ID_GETENTSPACE, reinterpret_cast<uint32*>(&cmd), sizeof(cmd), reinterpret_cast<uint32*>(&result), sizeof(uint32), nullptr);
+
+	if(result < 0)
+	{
+		assert(result == Iop::CMcServ::RET_NO_ENTRY);
+		m_lastResult = MC2_RESULT_ERROR_NOT_FOUND;
+	}
+	else
+	{
+		m_lastResult = result;
+	}
+
+	m_lastCmd = SYSCALL_MC2_GETENTSPACE_ASYNC & 0xFF;
+
+	return 0;
+}
+
+int32 CLibMc2::GetDbcStatus(uint32 socketId, uint32 unknown)
+{
+	CLog::GetInstance().Print(LOG_NAME, "GetDbcStatus(socketId = %d, unknown = %d);\r\n",
+	                          socketId, unknown);
+	//Don't really know what that function does, but returning 0 seems to be the way to go
+	return 0;
+}
+
 int32 CLibMc2::ReadFileAsync(uint32 socketId, uint32 pathPtr, uint32 bufferPtr, uint32 offset, uint32 size)
 {
-	auto path = reinterpret_cast<const char*>(m_ram + pathPtr);
+	auto path = reinterpret_cast<const char*>(m_eeBios.GetStructPtr(pathPtr));
 
 	CLog::GetInstance().Print(LOG_NAME, "ReadFileAsync(socketId = %d, path = '%s', bufferPtr = 0x%08X, offset = 0x%08X, size = 0x%08X);\r\n",
 	                          socketId, path, bufferPtr, offset, size);
@@ -707,7 +846,7 @@ int32 CLibMc2::ReadFileAsync(uint32 socketId, uint32 pathPtr, uint32 bufferPtr, 
 
 int32 CLibMc2::WriteFileAsync(uint32 socketId, uint32 pathPtr, uint32 bufferPtr, uint32 offset, uint32 size)
 {
-	auto path = reinterpret_cast<const char*>(m_ram + pathPtr);
+	auto path = reinterpret_cast<const char*>(m_eeBios.GetStructPtr(pathPtr));
 
 	CLog::GetInstance().Print(LOG_NAME, "WriteFileAsync(socketId = %d, path = '%s', bufferPtr = 0x%08X, offset = 0x%08X, size = 0x%08X);\r\n",
 	                          socketId, path, bufferPtr, offset, size);

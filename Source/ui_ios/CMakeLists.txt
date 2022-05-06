@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.15)
 
 set(CMAKE_MODULE_PATH
 	${CMAKE_CURRENT_SOURCE_DIR}/../../deps/Dependencies/cmake-modules
@@ -6,7 +6,16 @@ set(CMAKE_MODULE_PATH
 )
 include(Header)
 
-project(PlayUI)
+project(PlayUI LANGUAGES C Swift)
+
+set(USE_GSH_VULKAN OFF)
+find_package(Vulkan)
+if(Vulkan_FOUND)
+	set(USE_GSH_VULKAN ON)
+	message("Building with Vulkan support.")
+else()
+	message("Building without Vulkan support. If you want to enable Vulkan, please make sure VULKAN_SDK is set and place its path inside CMAKE_PREFIX_PATH.")
+endif()
 
 if(NOT TARGET PlayCore)
 	add_subdirectory(
@@ -24,12 +33,23 @@ if(NOT TARGET gsh_opengl)
 endif()
 list(INSERT PROJECT_LIBS 0 gsh_opengl)
 
+if(USE_GSH_VULKAN)
+	if(NOT TARGET gsh_vulkan)
+		add_subdirectory(
+			${CMAKE_CURRENT_SOURCE_DIR}/../gs/GSH_Vulkan
+			${CMAKE_CURRENT_BINARY_DIR}/gs/GSH_Vulkan
+		)
+	endif()
+	list(INSERT PROJECT_LIBS 0 gsh_vulkan)
+	list(APPEND DEFINITIONS_LIST HAS_GSH_VULKAN=1)
+endif()
+
 if(NOT TARGET sh_openal)
 	add_subdirectory(
 		${CMAKE_CURRENT_SOURCE_DIR}/../../tools/PsfPlayer/Source/SH_OpenAL
 		${CMAKE_CURRENT_BINARY_DIR}/SH_OpenAL
 	)
-	endif()
+endif()
 list(APPEND PROJECT_LIBS sh_openal)
 
 if(NOT TARGET iCade_Static)
@@ -53,8 +73,16 @@ if(NOT TARGET ui_shared)
 		${CMAKE_CURRENT_SOURCE_DIR}/../ui_shared
 		${CMAKE_CURRENT_BINARY_DIR}/ui_shared
 	)
-	endif()
+endif()
 list(APPEND PROJECT_LIBS ui_shared)
+
+if(NOT TARGET AltKit)
+	add_subdirectory(
+		${CMAKE_CURRENT_SOURCE_DIR}/../../deps/AltKit
+		${CMAKE_CURRENT_BINARY_DIR}/AltKit
+	)
+endif()
+list(APPEND PROJECT_LIBS AltKit)
 
 find_library(UIKIT_LIBRARY NAMES UIKit)
 find_library(COREGRAPHICS_LIBRARY NAMES CoreGraphics)
@@ -63,16 +91,19 @@ find_library(QUARTZCORE_LIBRARY NAMES QuartzCore)
 find_library(IMAGEIO_LIBRARY NAMES ImageIO)
 
 set(OSX_SOURCES
+	AltServerJitService.mm
 	AppDelegate.mm
 	BackgroundLayer.m
 	CoverViewCell.m
 	CoverViewController.mm
 	DebuggerSimulator.cpp
 	EmulatorViewController.mm
-	GlEsView.mm
 	GSH_OpenGLiOS.cpp
 	main.mm
-	ResolutionFactorSelectorViewController.mm
+	PreferenceDefs.h
+	RenderView.mm
+	SaveStateViewController.m
+	SettingsListSelectorViewController.mm
 	SettingsViewController.mm
 	VirtualPadButton.mm
 	VirtualPadItem.mm
@@ -81,15 +112,17 @@ set(OSX_SOURCES
 )
 
 set(OSX_HEADERS
+	AltServerJitService.h
 	AppDelegate.h
 	BackgroundLayer.h
 	CoverViewCell.h
 	CoverViewController.h
 	DebuggerSimulator.h
 	EmulatorViewController.h
-	GlEsView.h
 	GSH_OpenGLiOS.h
-	ResolutionFactorSelectorViewController.h
+	RenderView.h
+	SaveStateViewController.h
+	SettingsListSelectorViewController.h
 	SettingsViewController.h
 	VirtualPadButton.h
 	VirtualPadItem.h
@@ -116,9 +149,15 @@ set(OSX_RES
 	${CMAKE_CURRENT_SOURCE_DIR}/Resources/analogstick.png
 )
 
+if(USE_GSH_VULKAN)
+	list(APPEND OSX_SOURCES GSH_VulkaniOS.cpp)
+	list(APPEND OSX_HEADERS GSH_VulkaniOS.h)
+	list(APPEND OSX_RES "$ENV{VULKAN_SDK}/../MoltenVK/dylib/iOS/libMoltenVK.dylib")
+endif()
+
 # Add our Executable
 add_executable(Play MACOSX_BUNDLE ${OSX_SOURCES} ${OSX_HEADERS} ${OSX_RES})
-set_target_properties(Play PROPERTIES COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
+target_compile_options(Play PRIVATE $<$<NOT:$<COMPILE_LANGUAGE:Swift>>:-x objective-c++ -fobjc-arc>)
 
 # Probably a better way to set the framework link libraries.
 target_link_libraries(Play ${UIKIT_LIBRARY})
@@ -127,6 +166,8 @@ target_link_libraries(Play ${GAMECONTROLLER_LIBRARY})
 target_link_libraries(Play ${QUARTZCORE_LIBRARY})
 target_link_libraries(Play ${IMAGEIO_LIBRARY})
 target_link_libraries(Play ${PROJECT_LIBS} "-ObjC -lsqlite3 -framework OpenAL")
+
+target_compile_definitions(Play PRIVATE ${DEFINITIONS_LIST})
 
 # Set a custom plist file for the app bundle
 # NOTE: for these values to be used Info.plist has to be edited

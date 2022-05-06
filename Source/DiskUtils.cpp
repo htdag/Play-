@@ -4,6 +4,7 @@
 #include "make_unique.h"
 #include "stricmp.h"
 #include "DiskUtils.h"
+#include "discimages/ChdImageStream.h"
 #include "discimages/CsoImageStream.h"
 #include "discimages/CueSheet.h"
 #include "discimages/IszImageStream.h"
@@ -20,6 +21,11 @@
 #endif
 #ifdef __ANDROID__
 #include "PosixFileStream.h"
+#include "android/ContentStream.h"
+#include "android/ContentUtils.h"
+#endif
+#ifdef __EMSCRIPTEN__
+#include "Js_DiscImageDeviceStream.h"
 #endif
 #ifdef __APPLE__
 #include "TargetConditionals.h"
@@ -46,7 +52,17 @@ static Framework::CStream* CreateImageStream(const fs::path& imagePath)
 #endif
 	}
 #ifdef __ANDROID__
-	return new Framework::CPosixFileStream(imagePathString.c_str(), O_RDONLY);
+	if(Framework::Android::CContentUtils::IsContentPath(imagePath))
+	{
+		auto uri = Framework::Android::CContentUtils::BuildUriFromPath(imagePath);
+		return new Framework::Android::CContentStream(uri.c_str(), "r");
+	}
+	else
+	{
+		return new Framework::CPosixFileStream(imagePathString.c_str(), O_RDONLY);
+	}
+#elif defined(__EMSCRIPTEN__)
+	return new CJsDiscImageDeviceStream();
 #else
 	return new Framework::CStdStream(imagePathString.c_str(), "rb");
 #endif
@@ -88,9 +104,29 @@ static DiskUtils::OpticalMediaPtr CreateOpticalMediaFromMds(const fs::path& imag
 	return COpticalMedia::CreateDvd(imageDataStream, discImage.IsDualLayer(), discImage.GetLayerBreak());
 }
 
+static DiskUtils::OpticalMediaPtr CreateOpticalMediaFromChd(const fs::path& imagePath)
+{
+	//Some notes about CHD support:
+	//- We don't support multi track CDs
+	auto imageStream = std::make_shared<CChdImageStream>(CreateImageStream(imagePath));
+	auto blockProvider = [&imageStream]() -> COpticalMedia::BlockProviderPtr {
+		switch(imageStream->GetTrack0Type())
+		{
+		default:
+			assert(false);
+			[[fallthrough]];
+		case CChdImageStream::TRACK_TYPE_MODE1:
+			return std::make_shared<ISO9660::CBlockProviderCustom<0x990, 0>>(imageStream);
+		case CChdImageStream::TRACK_TYPE_MODE2_RAW:
+			return std::make_shared<ISO9660::CBlockProviderCustom<0x990, 0x18>>(imageStream);
+		}
+	}();
+	return COpticalMedia::CreateCustomSingleTrack(blockProvider);
+}
+
 const DiskUtils::ExtensionList& DiskUtils::GetSupportedExtensions()
 {
-	static auto extensionList = ExtensionList{".iso", ".mds", ".isz", ".cso", ".cue"};
+	static auto extensionList = ExtensionList{".iso", ".mds", ".isz", ".cso", ".cue", ".chd"};
 	return extensionList;
 }
 
@@ -105,6 +141,10 @@ DiskUtils::OpticalMediaPtr DiskUtils::CreateOpticalMediaFromPath(const fs::path&
 	if(!stricmp(extension.c_str(), ".isz"))
 	{
 		stream = std::make_shared<CIszImageStream>(CreateImageStream(imagePath));
+	}
+	else if(!stricmp(extension.c_str(), ".chd"))
+	{
+		return CreateOpticalMediaFromChd(imagePath);
 	}
 	else if(!stricmp(extension.c_str(), ".cso"))
 	{

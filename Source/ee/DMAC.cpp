@@ -31,9 +31,6 @@
 #define STATE_REGS_D8_SADR ("D8_SADR")
 #define STATE_REGS_D9_SADR ("D9_SADR")
 
-#define MADR_WRITE_MASK (~0x0000000F)
-#define SPR_MADR_WRITE_MASK (~0x8000000F)
-
 #define SADR_WRITE_MASK ((PS2::EE_SPR_SIZE - 1) & ~0x0F)
 
 #define REGISTER_READ(addr, value) \
@@ -167,7 +164,7 @@ void CDMAC::SetChannelTransferFunction(unsigned int channel, const DmaReceiveHan
 	}
 }
 
-bool CDMAC::IsInterruptPending()
+bool CDMAC::IsInterruptPending() const
 {
 	uint16 mask = static_cast<uint16>((m_D_STAT & 0x63FF0000) >> 16);
 	uint16 status = static_cast<uint16>((m_D_STAT & 0x0000E3FF) >> 0);
@@ -194,6 +191,11 @@ uint32 CDMAC::ResumeDMA3(const void* pBuffer, uint32 nSize)
 {
 	if(!(m_D3_CHCR & CHCR_STR)) return 0;
 
+	if((m_D_CTRL.sts == D_CTRL_STS_FROM_IPU) && (m_D_CTRL.std != D_CTRL_STD_NONE))
+	{
+		assert(m_D3_MADR >= m_D_STADR);
+	}
+
 	nSize = std::min<uint32>(nSize, m_D3_QWC);
 
 	void* pDst = nullptr;
@@ -211,10 +213,15 @@ uint32 CDMAC::ResumeDMA3(const void* pBuffer, uint32 nSize)
 	m_D3_MADR += (nSize * 0x10);
 	m_D3_QWC -= nSize;
 
+	if(m_D_CTRL.sts == D_CTRL_STS_FROM_IPU)
+	{
+		m_D_STADR = m_D3_MADR;
+	}
+
 	if(m_D3_QWC == 0)
 	{
 		m_D3_CHCR &= ~CHCR_STR;
-		m_D_STAT |= 0x08;
+		m_D_STAT |= (1 << CHANNEL_ID_FROM_IPU);
 	}
 
 	return nSize;
@@ -232,25 +239,31 @@ void CDMAC::ResumeDMA8()
 
 bool CDMAC::IsDMA4Started() const
 {
-	return (m_D4.m_CHCR.nSTR != 0) && (m_D_ENABLE == 0);
+	return (m_D4.m_CHCR.nSTR != 0) && ((m_D_ENABLE & CDMAC::ENABLE_CPND) == 0);
 }
 
-uint64 CDMAC::FetchDMATag(uint32 nAddress)
+uint64 CDMAC::FetchDMATag(uint32 address)
 {
-	if(nAddress & 0x80000000)
+	if(address & 0x80000000)
 	{
-		return *(uint64*)&m_spr[nAddress & 0x3FFF];
+		return *reinterpret_cast<uint64*>(&m_spr[address & (PS2::EE_SPR_SIZE - 1)]);
 	}
 	else
 	{
-		return *(uint64*)&m_ram[nAddress & 0x1FFFFFF];
+		return *reinterpret_cast<uint64*>(&m_ram[address & (PS2::EE_RAM_SIZE - 1)]);
 	}
 }
 
-bool CDMAC::IsEndSrcTagId(uint32 nTag)
+bool CDMAC::IsEndSrcTagId(uint32 tag)
 {
-	nTag = ((nTag >> 28) & 0x07);
-	return ((nTag == CChannel::DMATAG_SRC_REFE) || (nTag == CChannel::DMATAG_SRC_END));
+	tag = ((tag >> 12) & 0x07);
+	return ((tag == CChannel::DMATAG_SRC_REFE) || (tag == CChannel::DMATAG_SRC_END));
+}
+
+bool CDMAC::IsEndDstTagId(uint32 tag)
+{
+	tag = ((tag >> 12) & 0x07);
+	return (tag == CChannel::DMATAG_DST_END);
 }
 
 uint32 CDMAC::ReceiveDMA8(uint32 nDstAddress, uint32 nCount, uint32 unused, bool nTagIncluded)
@@ -258,14 +271,25 @@ uint32 CDMAC::ReceiveDMA8(uint32 nDstAddress, uint32 nCount, uint32 unused, bool
 	assert(nTagIncluded == false);
 	assert(m_D8_SADR < PS2::EE_SPR_SIZE);
 
-	nDstAddress &= (PS2::EE_RAM_SIZE - 1);
+	uint8* dstPtr = nullptr;
+	if((nDstAddress >= PS2::VUMEM0ADDR) && (nDstAddress < (PS2::VUMEM0ADDR + PS2::VUMEM0SIZE)))
+	{
+		nDstAddress -= PS2::VUMEM0ADDR;
+		nDstAddress &= (PS2::VUMEM0SIZE - 1);
+		dstPtr = m_vuMem0;
+	}
+	else
+	{
+		nDstAddress &= (PS2::EE_RAM_SIZE - 1);
+		dstPtr = m_ram;
+	}
 
 	uint32 remainTransfer = nCount;
 	while(remainTransfer != 0)
 	{
 		uint32 remainSpr = (PS2::EE_SPR_SIZE - m_D8_SADR) / 0x10;
 		uint32 copySize = std::min<uint32>(remainSpr, remainTransfer);
-		memcpy(m_ram + nDstAddress, m_spr + m_D8_SADR, copySize * 0x10);
+		memcpy(dstPtr + nDstAddress, m_spr + m_D8_SADR, copySize * 0x10);
 
 		remainTransfer -= copySize;
 		nDstAddress += (copySize * 0x10);
@@ -453,6 +477,11 @@ uint32 CDMAC::GetRegister(uint32 nAddress)
 		REGISTER_READ(D9_TADR, m_D9.m_nTADR)
 		REGISTER_READ(D9_SADR, m_D9_SADR)
 
+	case D9_CHCR + 0x1:
+		//This is done by AirBlade
+		return m_D9.ReadCHCR() >> 8;
+		break;
+
 	//General Registers
 	case D_CTRL:
 		return m_D_CTRL;
@@ -608,7 +637,7 @@ void CDMAC::SetRegister(uint32 nAddress, uint32 nData)
 
 	//D2_QWC
 	case D2_QWC + 0x0:
-		m_D2.m_nQWC = nData;
+		m_D2.m_nQWC = nData & QWC_WRITE_MASK;
 		break;
 	case D2_QWC + 0x4:
 	case D2_QWC + 0x8:
@@ -820,6 +849,10 @@ void CDMAC::SetRegister(uint32 nAddress, uint32 nData)
 	//Channel 9
 	case D9_CHCR + 0x0:
 		m_D9.WriteCHCR(nData);
+		break;
+	case D9_CHCR + 0x1:
+		//This is done by AirBlade
+		m_D9.WriteCHCR((m_D9.ReadCHCR() & ~0xFF00) | ((nData & 0xFF) << 8));
 		break;
 	case D9_CHCR + 0x4:
 	case D9_CHCR + 0x8:
@@ -1046,6 +1079,7 @@ void CDMAC::DisassembleGet(uint32 nAddress)
 		//Channel 1
 		LOG_GET(D1_CHCR)
 		LOG_GET(D1_MADR)
+		LOG_GET(D1_QWC)
 		LOG_GET(D1_TADR)
 		LOG_GET(D1_ASR0)
 		LOG_GET(D1_ASR1)
@@ -1053,6 +1087,7 @@ void CDMAC::DisassembleGet(uint32 nAddress)
 		//Channel 2
 		LOG_GET(D2_CHCR)
 		LOG_GET(D2_MADR)
+		LOG_GET(D2_QWC)
 		LOG_GET(D2_TADR)
 		LOG_GET(D2_ASR0)
 		LOG_GET(D2_ASR1)

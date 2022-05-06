@@ -41,10 +41,6 @@ using namespace Iop;
 #define FUNCTION_SEEK64 "Seek64"
 #define FUNCTION_DEVCTL "DevCtl"
 
-//Directories have "group read" only permissions? This is required by PS2PSXe.
-#define STAT_MODE_DIR (0747 | (1 << 12))  //File mode + Dir type (1)
-#define STAT_MODE_FILE (0777 | (2 << 12)) //File mode + File type (2)
-
 /** No such file or directory */
 #define ERROR_ENOENT 2
 
@@ -54,6 +50,7 @@ using namespace Iop;
 #define DEVCTL_CDVD_DISKREADY 0x4325
 
 #define DEVCTL_HDD_STATUS 0x4807
+#define DEVCTL_HDD_MAXSECTOR 0x4801
 #define DEVCTL_HDD_TOTALSECTOR 0x4802
 #define DEVCTL_HDD_FREESECTOR 0x480A
 
@@ -183,6 +180,18 @@ std::string CIoman::GetFunctionName(unsigned int functionId) const
 		break;
 	case 8:
 		return "seek";
+		break;
+	case 11:
+		return "mkdir";
+		break;
+	case 13:
+		return "dopen";
+		break;
+	case 14:
+		return "dclose";
+		break;
+	case 15:
+		return "dread";
 		break;
 	case 16:
 		return "getstat";
@@ -374,7 +383,7 @@ int32 CIoman::Dopen(const char* path)
 		}
 		auto directory = deviceIterator->second->GetDirectory(pathInfo.devicePath.c_str());
 		handle = m_nextFileHandle++;
-		m_directories[handle] = directory;
+		m_directories[handle] = std::move(directory);
 	}
 	catch(const std::exception& except)
 	{
@@ -410,31 +419,12 @@ int32 CIoman::Dread(uint32 handle, Ioman::DIRENTRY* dirEntry)
 	}
 
 	auto& directory = directoryIterator->second;
-	if(directory == Ioman::Directory())
+	if(directory->IsDone())
 	{
 		return 0;
 	}
 
-	auto itemPath = directory->path();
-	auto name = itemPath.filename().string();
-	strncpy(dirEntry->name, name.c_str(), Ioman::DIRENTRY::NAME_SIZE);
-	dirEntry->name[Ioman::DIRENTRY::NAME_SIZE - 1] = 0;
-
-	auto& stat = dirEntry->stat;
-	memset(&stat, 0, sizeof(Ioman::STAT));
-	if(fs::is_directory(itemPath))
-	{
-		stat.mode = STAT_MODE_DIR;
-		stat.attr = 0x8427;
-	}
-	else
-	{
-		stat.mode = STAT_MODE_FILE;
-		stat.loSize = fs::file_size(itemPath);
-		stat.attr = 0x8497;
-	}
-
-	directory++;
+	directory->ReadEntry(dirEntry);
 
 	return strlen(dirEntry->name);
 }
@@ -450,7 +440,7 @@ uint32 CIoman::GetStat(const char* path, Ioman::STAT* stat)
 		{
 			Dclose(fd);
 			memset(stat, 0, sizeof(Ioman::STAT));
-			stat->mode = STAT_MODE_DIR;
+			stat->mode = Ioman::STAT_MODE_DIR;
 			return 0;
 		}
 	}
@@ -463,7 +453,7 @@ uint32 CIoman::GetStat(const char* path, Ioman::STAT* stat)
 			uint32 size = Seek(fd, 0, SEEK_DIR_END);
 			Close(fd);
 			memset(stat, 0, sizeof(Ioman::STAT));
-			stat->mode = STAT_MODE_FILE;
+			stat->mode = Ioman::STAT_MODE_FILE;
 			stat->loSize = size;
 			return 0;
 		}
@@ -617,6 +607,10 @@ int32 CIoman::DevCtl(const char* deviceName, uint32 command, const uint32* input
 		break;
 	case DEVCTL_HDD_STATUS:
 		CLog::GetInstance().Print(LOG_NAME, "HddStatus();\r\n");
+		break;
+	case DEVCTL_HDD_MAXSECTOR:
+		CLog::GetInstance().Print(LOG_NAME, "HddMaxSector();\r\n");
+		result = 0x400000; //Max num of sectors per partition
 		break;
 	case DEVCTL_HDD_TOTALSECTOR:
 		CLog::GetInstance().Print(LOG_NAME, "HddTotalSector();\r\n");
@@ -960,6 +954,23 @@ void CIoman::Invoke(CMIPS& context, unsigned int functionId)
 		break;
 	case 8:
 		context.m_State.nGPR[CMIPS::V0].nD0 = static_cast<int32>(SeekVirtual(context));
+		break;
+	case 11:
+		context.m_State.nGPR[CMIPS::V0].nD0 = static_cast<int32>(Mkdir(
+		    reinterpret_cast<char*>(&m_ram[context.m_State.nGPR[CMIPS::A0].nV[0]])));
+		break;
+	case 13:
+		context.m_State.nGPR[CMIPS::V0].nD0 = static_cast<int32>(Dopen(
+		    reinterpret_cast<char*>(&m_ram[context.m_State.nGPR[CMIPS::A0].nV[0]])));
+		break;
+	case 14:
+		context.m_State.nGPR[CMIPS::V0].nD0 = static_cast<int32>(Dclose(
+		    context.m_State.nGPR[CMIPS::A0].nV0));
+		break;
+	case 15:
+		context.m_State.nGPR[CMIPS::V0].nD0 = static_cast<int32>(Dread(
+		    context.m_State.nGPR[CMIPS::A0].nV0,
+		    reinterpret_cast<Ioman::DIRENTRY*>(&m_ram[context.m_State.nGPR[CMIPS::A1].nV[0]])));
 		break;
 	case 16:
 		context.m_State.nGPR[CMIPS::V0].nD0 = static_cast<int32>(GetStat(

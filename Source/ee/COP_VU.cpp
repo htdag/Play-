@@ -92,14 +92,21 @@ void CCOP_VU::LQC2()
 	}
 	m_codeGen->Else();
 	{
-		ComputeMemAccessAddrNoXlat();
+		if(m_codeGen->GetCodeGen()->Has128BitsCallOperands())
+		{
+			ComputeMemAccessAddrNoXlat();
 
-		m_codeGen->PushCtx();
-		m_codeGen->PushIdx(1);
-		m_codeGen->Call(reinterpret_cast<void*>(&MemoryUtils_GetQuadProxy), 2, Jitter::CJitter::RETURN_VALUE_128);
-		m_codeGen->MD_PullRel(offsetof(CMIPS, m_State.nCOP2[m_nFT]));
+			m_codeGen->PushCtx();
+			m_codeGen->PushIdx(1);
+			m_codeGen->Call(reinterpret_cast<void*>(&MemoryUtils_GetQuadProxy), 2, Jitter::CJitter::RETURN_VALUE_128);
+			m_codeGen->MD_PullRel(offsetof(CMIPS, m_State.nCOP2[m_nFT]));
 
-		m_codeGen->PullTop();
+			m_codeGen->PullTop();
+		}
+		else
+		{
+			m_codeGen->Break();
+		}
 	}
 	m_codeGen->EndIf();
 }
@@ -119,14 +126,21 @@ void CCOP_VU::SQC2()
 	}
 	m_codeGen->Else();
 	{
-		ComputeMemAccessAddrNoXlat();
+		if(m_codeGen->GetCodeGen()->Has128BitsCallOperands())
+		{
+			ComputeMemAccessAddrNoXlat();
 
-		m_codeGen->PushCtx();
-		m_codeGen->MD_PushRel(offsetof(CMIPS, m_State.nCOP2[m_nFT]));
-		m_codeGen->PushIdx(2);
-		m_codeGen->Call(reinterpret_cast<void*>(&MemoryUtils_SetQuadProxy), 3, Jitter::CJitter::RETURN_VALUE_NONE);
+			m_codeGen->PushCtx();
+			m_codeGen->MD_PushRel(offsetof(CMIPS, m_State.nCOP2[m_nFT]));
+			m_codeGen->PushIdx(2);
+			m_codeGen->Call(reinterpret_cast<void*>(&MemoryUtils_SetQuadProxy), 3, Jitter::CJitter::RETURN_VALUE_NONE);
 
-		m_codeGen->PullTop();
+			m_codeGen->PullTop();
+		}
+		else
+		{
+			m_codeGen->Break();
+		}
 	}
 	m_codeGen->EndIf();
 }
@@ -304,8 +318,27 @@ void CCOP_VU::BC2()
 	//Not implemented
 	//We assume that this is used to check if VU0 is still running
 	//after VCALLMS* is used (used in .hack games)
+	//Also used in Kya: Dark Lineage
+	//For now, we just make it as if VU0 is not running
+
 	uint32 op = (m_nOpcode >> 16) & 0x03;
-	assert(op == 0x01);
+	switch(op)
+	{
+	case 0x00:
+		//BC2F
+		//(running == false) -> Branch
+		m_codeGen->PushCst(0);
+		m_codeGen->PushCst(0);
+		Branch(Jitter::CONDITION_EQ);
+		break;
+	case 0x01:
+		//BC2T
+		//(running == false) -> Do not branch
+		break;
+	default:
+		Illegal();
+		break;
+	}
 }
 
 //10-1F

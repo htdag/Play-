@@ -26,6 +26,7 @@
 #include "Iop_MtapMan.h"
 #include "Iop_Cdvdfsv.h"
 #include "Iop_McServ.h"
+#include "Iop_PowerOff.h"
 #endif
 
 class CIopBios : public Iop::CBiosBase
@@ -155,15 +156,21 @@ public:
 		uint32 reserved[2];
 	};
 
+	enum class MODULESTARTREQUEST_SOURCE
+	{
+		LOCAL,
+		REMOTE,
+	};
+
 	CIopBios(CMIPS&, uint8*, uint32, uint8*);
 	virtual ~CIopBios();
 
-	int32 LoadModule(const char*);
-	int32 LoadModule(uint32);
+	int32 LoadModuleFromPath(const char*, uint32 = ~0U, bool = true);
+	int32 LoadModuleFromAddress(uint32, uint32 = ~0U, bool = true);
 	int32 LoadModuleFromHost(uint8*);
 	int32 UnloadModule(uint32);
-	int32 StartModule(uint32, const char*, const char*, uint32);
-	int32 StopModule(uint32);
+	int32 StartModule(MODULESTARTREQUEST_SOURCE, uint32, const char*, const char*, uint32);
+	int32 StopModule(MODULESTARTREQUEST_SOURCE, uint32);
 	bool CanStopModule(uint32) const;
 	bool IsModuleHle(uint32) const;
 	int32 SearchModuleByName(const char*) const;
@@ -233,7 +240,7 @@ public:
 	void SleepThreadTillVBlankStart();
 	void SleepThreadTillVBlankEnd();
 
-	uint32 CreateSemaphore(uint32, uint32);
+	uint32 CreateSemaphore(uint32, uint32, uint32, uint32);
 	uint32 DeleteSemaphore(uint32);
 	uint32 SignalSemaphore(uint32, bool);
 	uint32 WaitSemaphore(uint32);
@@ -275,7 +282,7 @@ public:
 	int32 RegisterIntrHandler(uint32, uint32, uint32, uint32);
 	int32 ReleaseIntrHandler(uint32);
 
-	void TriggerCallback(uint32 address, uint32 arg0 = 0, uint32 arg1 = 0, uint32 arg2 = 0, uint32 arg3 = 0);
+	int32 TriggerCallback(uint32 address, uint32 arg0 = 0, uint32 arg1 = 0, uint32 arg2 = 0, uint32 arg3 = 0);
 
 #ifdef DEBUGGER_INCLUDED
 	void LoadDebugTags(Framework::Xml::CNode*) override;
@@ -324,9 +331,9 @@ private:
 	enum
 	{
 		MAX_THREAD = 128,
-		MAX_MEMORYBLOCK = 256,
+		MAX_MEMORYBLOCK = 1024,
 		MAX_SEMAPHORE = 128,
-		MAX_EVENTFLAG = 64,
+		MAX_EVENTFLAG = 128,
 		MAX_INTRHANDLER = 32,
 		MAX_VBLANKHANDLER = 8,
 		MAX_MESSAGEBOX = 32,
@@ -350,6 +357,8 @@ private:
 		uint32 count;
 		uint32 maxCount;
 		uint32 waitCount;
+		uint32 attrib;
+		uint32 option;
 	};
 
 	struct SEMAPHORE_STATUS
@@ -491,6 +500,11 @@ private:
 	{
 		enum
 		{
+			INVALID_PTR = -1,
+		};
+
+		enum
+		{
 			MAX_PATH_SIZE = 256,
 			MAX_ARGS_SIZE = 256
 		};
@@ -498,6 +512,7 @@ private:
 		uint32 nextPtr;
 		uint32 moduleId;
 		uint32 stopRequest;
+		int32 requesterThreadId;
 		char path[MAX_PATH_SIZE];
 		uint32 argsLength;
 		char args[MAX_ARGS_SIZE];
@@ -517,6 +532,7 @@ private:
 		uint32 end;
 		uint32 entryPoint;
 		uint32 gp;
+		uint32 ownsMemory;
 		MODULE_STATE state;
 		MODULE_RESIDENT_STATE residentState;
 	};
@@ -586,10 +602,10 @@ private:
 	uint32& ModuleStartRequestHead() const;
 	uint32& ModuleStartRequestFree() const;
 
-	int32 LoadModule(CELF&, const char*);
-	uint32 LoadExecutable(CELF&, ExecutableRange&);
+	int32 LoadModule(CELF&, const char*, uint32, bool);
+	uint32 LoadExecutable(CELF&, ExecutableRange&, uint32);
 	unsigned int GetElfProgramToLoad(CELF&);
-	void RelocateElf(CELF&, uint32);
+	void RelocateElf(CELF&, uint32, uint32);
 	std::string ReadModuleName(uint32);
 	void DeleteModules();
 
@@ -601,14 +617,14 @@ private:
 	uint32 AssembleThreadFinish(CMIPSAssembler&);
 	uint32 AssembleReturnFromException(CMIPSAssembler&);
 	uint32 AssembleIdleFunction(CMIPSAssembler&);
-	uint32 AssembleModuleStarterThreadProc(CMIPSAssembler&);
+	uint32 AssembleModuleStarterProc(CMIPSAssembler&);
 	uint32 AssembleAlarmThreadProc(CMIPSAssembler&);
 	uint32 AssembleVblankHandler(CMIPSAssembler&);
 
 	void InitializeModuleStarter();
 	void ProcessModuleStart();
 	void FinishModuleStart();
-	void RequestModuleStart(bool, uint32, const char*, const char*, unsigned int);
+	void RequestModuleStart(MODULESTARTREQUEST_SOURCE, bool, uint32, const char*, const char*, unsigned int);
 
 	void PopulateSystemIntcHandlers();
 
@@ -625,11 +641,9 @@ private:
 	uint32 m_threadFinishAddress;
 	uint32 m_returnFromExceptionAddress;
 	uint32 m_idleFunctionAddress;
-	uint32 m_moduleStarterThreadProcAddress;
+	uint32 m_moduleStarterProcAddress;
 	uint32 m_alarmThreadProcAddress;
 	uint32 m_vblankHandlerAddress;
-
-	uint32 m_moduleStarterThreadId;
 
 	bool m_rescheduleNeeded = false;
 	LoadedModuleList m_loadedModules;
@@ -642,6 +656,8 @@ private:
 	MessageBoxList m_messageBoxes;
 	FplList m_fpls;
 	VplList m_vpls;
+
+	MODULESTARTREQUEST m_moduleStartRequests[MAX_MODULESTARTREQUEST] = {};
 
 	IopModuleMapType m_modules;
 
@@ -665,6 +681,7 @@ private:
 	Iop::MtapManPtr m_mtapman;
 	Iop::McServPtr m_mcserv;
 	Iop::CdvdfsvPtr m_cdvdfsv;
+	Iop::PowerOffPtr m_powerOff;
 
 	std::map<std::string, Iop::ModulePtr> m_hleModules;
 #endif

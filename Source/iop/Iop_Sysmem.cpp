@@ -35,10 +35,6 @@ CSysmem::CSysmem(uint8* ram, uint32 memoryBegin, uint32 memoryEnd, BlockListType
 	sifMan.RegisterModule(MODULE_ID, this);
 }
 
-CSysmem::~CSysmem()
-{
-}
-
 std::string CSysmem::GetId() const
 {
 	return "sysmem";
@@ -137,7 +133,7 @@ bool CSysmem::Invoke(uint32 method, uint32* args, uint32 argsSize, uint32* ret, 
 		ret[0] = QueryTotalFreeMemSize();
 		break;
 	default:
-		CLog::GetInstance().Print(LOG_NAME, "Unknown method invoked (0x%08X).\r\n", method);
+		CLog::GetInstance().Warn(LOG_NAME, "Unknown method invoked (0x%08X).\r\n", method);
 		break;
 	}
 	return true;
@@ -169,6 +165,7 @@ uint32 CSysmem::QueryMaxFreeMemSize()
 	while(nextBlock != nullptr)
 	{
 		uint32 end = nextBlock->address;
+		assert(end >= begin);
 		if((end - begin) >= maxSize)
 		{
 			maxSize = end - begin;
@@ -177,6 +174,7 @@ uint32 CSysmem::QueryMaxFreeMemSize()
 		nextBlockId = &nextBlock->nextBlockId;
 		nextBlock = m_blocks[*nextBlockId];
 	}
+	assert(maxSize <= m_memorySize);
 	return maxSize;
 }
 
@@ -247,6 +245,7 @@ uint32 CSysmem::AllocateMemory(uint32 size, uint32 flags, uint32 wantedAddress)
 			}
 			if(
 			    (begin <= wantedAddress) &&
+			    (wantedAddress < end) &&
 			    ((end - begin) >= size))
 			{
 				break;
@@ -303,12 +302,28 @@ uint32 CSysmem::FreeMemory(uint32 address)
 	{
 		m_blocks.Free(*nextBlockId);
 		*nextBlockId = nextBlock->nextBlockId;
+		return 0;
 	}
 	else
 	{
 		CLog::GetInstance().Warn(LOG_NAME, "%s: Trying to unallocate an unexisting memory block (0x%08X).\r\n", __FUNCTION__, address);
+		return -1;
 	}
-	return 0;
+}
+
+void CSysmem::DumpAllocList()
+{
+	auto nextBlockId = &m_headBlockId;
+	auto nextBlock = m_blocks[*nextBlockId];
+	CLog::GetInstance().Print(LOG_NAME, "Alloc List\r\n");
+	CLog::GetInstance().Print(LOG_NAME, "------------------------------\r\n");
+	while(nextBlock != nullptr)
+	{
+		CLog::GetInstance().Print(LOG_NAME, "addr: %08X, size: %08X\r\n", nextBlock->address, nextBlock->size);
+		nextBlockId = &nextBlock->nextBlockId;
+		nextBlock = m_blocks[*nextBlockId];
+	}
+	CLog::GetInstance().Print(LOG_NAME, "------------------------------\r\n");
 }
 
 uint32 CSysmem::SifAllocate(uint32 nSize)
@@ -347,6 +362,5 @@ uint32 CSysmem::SifLoadMemory(uint32 address, const char* filePath)
 uint32 CSysmem::SifFreeMemory(uint32 address)
 {
 	CLog::GetInstance().Print(LOG_NAME, "FreeMemory(address = 0x%08X);\r\n", address);
-	FreeMemory(address);
-	return 0;
+	return FreeMemory(address);
 }

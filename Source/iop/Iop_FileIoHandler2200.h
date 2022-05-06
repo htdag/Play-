@@ -265,9 +265,10 @@ namespace Iop
 			REPLYHEADER header;
 			uint32 result;
 			uint32 dirEntryPtr;
-			uint32 unknown3;
-			uint32 unknown4;
+			Ioman::STATEX stat;
+			char name[Ioman::DIRENTRY::NAME_SIZE];
 		};
+		static_assert(sizeof(DREADREPLY) == 0x158, "DREADREPLY must be 0x158 bytes long.");
 
 		struct GETSTATREPLY
 		{

@@ -11,14 +11,12 @@ project(PlayUI)
 add_definitions(-DPLAY_VERSION="${PROJECT_Version}")
 
 set(USE_GSH_VULKAN OFF)
-if(NOT TARGET_PLATFORM_UNIX_AARCH64)
-	find_package(Vulkan)
-	if(Vulkan_FOUND)
-		set(USE_GSH_VULKAN ON)
-		message("Building with Vulkan support.")
-	else()
-		message("Building without Vulkan support. If you want to enable Vulkan, please make sure VULKAN_SDK is set.")
-	endif()
+find_package(Vulkan)
+if(Vulkan_FOUND)
+	set(USE_GSH_VULKAN ON)
+	message("Building with Vulkan support.")
+else()
+	message("Building without Vulkan support. If you want to enable Vulkan, please make sure VULKAN_SDK is set.")
 endif()
 
 if(NOT TARGET PlayCore)
@@ -90,10 +88,10 @@ if(NOT TARGET ui_shared)
 list(APPEND PROJECT_LIBS ui_shared)
 
 set(QT_SOURCES
-	bootablelistdialog.cpp
-	bootablelistdialog.h
 	BootableModel.cpp
 	BootableModel.h
+	BootableModelProxy.cpp
+	BootableModelProxy.h
 	ControllerConfig/controllerconfigdialog.cpp
 	ControllerConfig/controllerconfigdialog.h
 	ControllerConfig/inputbindingmodel.cpp
@@ -122,6 +120,8 @@ set(QT_SOURCES
 	memorycardmanagerdialog.cpp
 	memorycardmanagerdialog.h
 	PreferenceDefs.h
+	QBootablesView.cpp
+	QBootablesView.h
 	QStringUtils.cpp
 	QStringUtils.h
 	QtUtils.cpp
@@ -204,8 +204,8 @@ if(DEBUGGER_INCLUDED)
 endif()
 	
 set(QT_MOC_HEADERS
-	bootablelistdialog.h
 	BootableModel.h
+	BootableModelProxy.h
 	ControllerConfig/controllerconfigdialog.h
 	ControllerConfig/inputbindingmodel.h
 	ControllerConfig/inputeventselectiondialog.h
@@ -215,6 +215,7 @@ set(QT_MOC_HEADERS
 	settingsdialog.h
 	openglwindow.h
 	outputwindow.h
+	QBootablesView.h
 	memorycardmanagerdialog.h
 	vfsmanagerdialog.h
 	vfsmodel.h
@@ -224,8 +225,9 @@ set(QT_MOC_HEADERS
 )
 
 set(QT_UIS
-	Qt_ui/bootablelistdialog.ui
+	Qt_ui/bootableview.ui
 	Qt_ui/controllerconfigdialog.ui
+	Qt_ui/debugdockmenu.ui
 	Qt_ui/debugmenu.ui
 	Qt_ui/inputeventselectiondialog.ui
 	Qt_ui/mainwindow.ui
@@ -308,11 +310,31 @@ elseif(TARGET_PLATFORM_WIN32)
 elseif(TARGET_PLATFORM_UNIX)
 	add_executable(Play ${QT_SOURCES} ${QT_MOC_SRCS} ${QT_RES_SOURCES} ${QT_UI_HEADERS})
 
-	install(TARGETS Play DESTINATION bin RENAME Play PERMISSIONS OWNER_EXECUTE OWNER_WRITE OWNER_READ GROUP_EXECUTE GROUP_READ WORLD_EXECUTE WORLD_READ)
-
-	install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../../icons/icon_base.png DESTINATION share/icons/hicolor/1024x1024/apps RENAME Play.png)
-	install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../../icons/icon.svg DESTINATION share/icons/hicolor/scalable/apps RENAME Play.svg)
-	install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../../installer_unix/Play.desktop DESTINATION share/applications)
+	install(TARGETS Play DESTINATION ${CMAKE_INSTALL_BINDIR}
+		PERMISSIONS OWNER_EXECUTE OWNER_WRITE OWNER_READ GROUP_EXECUTE GROUP_READ WORLD_EXECUTE WORLD_READ
+		RENAME Play
+	)
+	install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../../icons/icon_base_512x512.png
+		DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/512x512/apps
+		RENAME org.purei.Play.png
+	)
+	install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../../icons/icon.svg
+		DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/scalable/apps
+		RENAME org.purei.Play.svg
+	)
+	install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../../installer_unix/org.purei.Play.desktop
+		DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/applications
+	)
+	install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../../installer_unix/org.purei.Play.metainfo.xml
+		DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/metainfo
+	)
+	if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../states.db")
+		install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../../states.db
+			DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/
+		)
+	else()
+		message(WARNING "didn't find states.db")
+	endif()
 else()
 	add_executable(Play ${QT_SOURCES} ${QT_MOC_SRCS} ${QT_RES_SOURCES} ${QT_UI_HEADERS})
 endif()

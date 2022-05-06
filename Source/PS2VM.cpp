@@ -1,6 +1,7 @@
-#include <stdio.h>
+#include <cstdio>
 #include <exception>
 #include <memory>
+#include <climits>
 #include <fenv.h>
 #include "FpUtils.h"
 #include "make_unique.h"
@@ -13,7 +14,6 @@
 #include "iop/Iop_SifManPs2.h"
 #include "StdStream.h"
 #include "StdStreamUtils.h"
-#include "GZipStream.h"
 #include "states/MemoryStateFile.h"
 #include "zip/ZipArchiveWriter.h"
 #include "zip/ZipArchiveReader.h"
@@ -27,8 +27,10 @@
 #include "iop/ioman/OpticalMediaDevice.h"
 #include "iop/ioman/PreferenceDirectoryDevice.h"
 #include "Log.h"
-#include "ISO9660/BlockProvider.h"
 #include "DiskUtils.h"
+#ifdef __ANDROID__
+#include "android/JavaVM.h"
+#endif
 
 #define LOG_NAME ("ps2vm")
 
@@ -87,13 +89,6 @@ CPS2VM::CPS2VM()
 	CAppConfig::GetInstance().RegisterPreferencePath(PREF_PS2_CDROM0_PATH, "");
 
 	Framework::PathUtils::EnsurePathExists(GetStateDirectoryPath());
-
-	m_iop = std::make_unique<Iop::CSubSystem>(true);
-	auto iopOs = dynamic_cast<CIopBios*>(m_iop->m_bios.get());
-
-	m_ee = std::make_unique<Ee::CSubSystem>(m_iop->m_ram, *iopOs);
-	m_OnRequestLoadExecutableConnection = m_ee->m_os->OnRequestLoadExecutable.Connect(std::bind(&CPS2VM::ReloadExecutable, this, std::placeholders::_1, std::placeholders::_2));
-	m_OnCrtModeChangeConnection = m_ee->m_os->OnCrtModeChange.Connect(std::bind(&CPS2VM::OnCrtModeChange, this));
 
 	CAppConfig::GetInstance().RegisterPreferenceBoolean(PREF_PS2_LIMIT_FRAMERATE, true);
 	ReloadFrameRateLimit();
@@ -165,7 +160,7 @@ void CPS2VM::DestroySoundHandler()
 void CPS2VM::ReloadFrameRateLimit()
 {
 	uint32 frameRate = 60;
-	if(m_ee->m_gs != nullptr)
+	if(m_ee && m_ee->m_gs)
 	{
 		frameRate = m_ee->m_gs->GetCrtFrameRate();
 	}
@@ -257,7 +252,6 @@ void CPS2VM::DumpEEDmacHandlers()
 
 void CPS2VM::Initialize()
 {
-	CreateVM();
 	m_nEnd = false;
 	m_thread = std::thread([&]() { EmuThread(); });
 }
@@ -333,20 +327,20 @@ CPS2VM::CPU_UTILISATION_INFO CPS2VM::GetCpuUtilisationInfo() const
 
 #define TAGS_PATH ("tags/")
 
-std::string CPS2VM::MakeDebugTagsPackagePath(const char* packageName)
+fs::path CPS2VM::MakeDebugTagsPackagePath(const char* packageName)
 {
 	auto tagsPath = CAppConfig::GetBasePath() / fs::path(TAGS_PATH);
 	Framework::PathUtils::EnsurePathExists(tagsPath);
 	auto tagsPackagePath = tagsPath / (std::string(packageName) + std::string(".tags.xml"));
-	return tagsPackagePath.string();
+	return tagsPackagePath;
 }
 
 void CPS2VM::LoadDebugTags(const char* packageName)
 {
 	try
 	{
-		std::string packagePath = MakeDebugTagsPackagePath(packageName);
-		Framework::CStdStream stream(packagePath.c_str(), "rb");
+		auto packagePath = MakeDebugTagsPackagePath(packageName);
+		auto stream = Framework::CreateInputStdStream(packagePath.native());
 		std::unique_ptr<Framework::Xml::CNode> document(Framework::Xml::CParser::ParseDocument(stream));
 		Framework::Xml::CNode* tagsNode = document->Select(TAGS_SECTION_TAGS);
 		if(!tagsNode) return;
@@ -373,8 +367,8 @@ void CPS2VM::SaveDebugTags(const char* packageName)
 {
 	try
 	{
-		std::string packagePath = MakeDebugTagsPackagePath(packageName);
-		Framework::CStdStream stream(packagePath.c_str(), "wb");
+		auto packagePath = MakeDebugTagsPackagePath(packageName);
+		auto stream = Framework::CreateOutputStdStream(packagePath.native());
 		std::unique_ptr<Framework::Xml::CNode> document(new Framework::Xml::CNode(TAGS_SECTION_TAGS, true));
 		m_ee->m_EE.m_Functions.Serialize(document.get(), TAGS_SECTION_EE_FUNCTIONS);
 		m_ee->m_EE.m_Comments.Serialize(document.get(), TAGS_SECTION_EE_COMMENTS);
@@ -402,6 +396,13 @@ void CPS2VM::SaveDebugTags(const char* packageName)
 
 void CPS2VM::CreateVM()
 {
+	m_iop = std::make_unique<Iop::CSubSystem>(true);
+	auto iopOs = dynamic_cast<CIopBios*>(m_iop->m_bios.get());
+
+	m_ee = std::make_unique<Ee::CSubSystem>(m_iop->m_ram, *iopOs);
+	m_OnRequestLoadExecutableConnection = m_ee->m_os->OnRequestLoadExecutable.Connect(std::bind(&CPS2VM::ReloadExecutable, this, std::placeholders::_1, std::placeholders::_2));
+	m_OnCrtModeChangeConnection = m_ee->m_os->OnCrtModeChange.Connect(std::bind(&CPS2VM::OnCrtModeChange, this));
+
 	ResetVM();
 }
 
@@ -409,8 +410,6 @@ void CPS2VM::ResetVM()
 {
 	m_ee->Reset();
 	m_iop->Reset();
-
-	//LoadBIOS();
 
 	if(m_ee->m_gs != NULL)
 	{
@@ -499,6 +498,7 @@ bool CPS2VM::LoadVMState(const fs::path& statePath)
 			m_ee->LoadState(archive);
 			m_iop->LoadState(archive);
 			m_ee->m_gs->LoadState(archive);
+			ReloadFrameRateLimit();
 		}
 		catch(...)
 		{
@@ -602,7 +602,7 @@ void CPS2VM::OnGsNewFrame()
 	std::unique_lock<std::mutex> dumpFrameCallbackMutexLock(m_frameDumpCallbackMutex);
 	if(m_dumpingFrame && !m_frameDump.GetPackets().empty())
 	{
-		m_ee->m_gs->SetFrameDump(nullptr);
+		m_ee->m_gs->EndFrameDump();
 		m_frameDumpCallback(m_frameDump);
 		m_dumpingFrame = false;
 		m_frameDumpCallback = FrameDumpCallback();
@@ -610,10 +610,7 @@ void CPS2VM::OnGsNewFrame()
 	else if(m_frameDumpCallback)
 	{
 		m_frameDump.Reset();
-		memcpy(m_frameDump.GetInitialGsRam(), m_ee->m_gs->GetRam(), CGSHandler::RAMSIZE);
-		memcpy(m_frameDump.GetInitialGsRegisters(), m_ee->m_gs->GetRegisters(), CGSHandler::REGISTER_MAX * sizeof(uint64));
-		m_frameDump.SetInitialSMODE2(m_ee->m_gs->GetSMODE2());
-		m_ee->m_gs->SetFrameDump(&m_frameDump);
+		m_ee->m_gs->BeginFrameDump(&m_frameDump);
 		m_dumpingFrame = true;
 	}
 #endif
@@ -630,14 +627,10 @@ void CPS2VM::UpdateEe()
 		int executed = m_ee->ExecuteCpu(m_singleStepEe ? 1 : m_eeExecutionTicks);
 		if(m_ee->IsCpuIdle())
 		{
-#ifdef PROFILE
 			m_cpuUtilisation.eeIdleTicks += (m_eeExecutionTicks - executed);
-#endif
 			executed = m_eeExecutionTicks;
 		}
-#ifdef PROFILE
 		m_cpuUtilisation.eeTotalTicks += executed;
-#endif
 
 		m_ee->m_vpu0->Execute(m_singleStepVu0 ? 1 : executed);
 		m_ee->m_vpu1->Execute(m_singleStepVu1 ? 1 : executed);
@@ -647,7 +640,7 @@ void CPS2VM::UpdateEe()
 		m_vblankTicks -= executed;
 
 #ifdef DEBUGGER_INCLUDED
-		if(m_singleStepEe) break;
+		if(m_singleStepEe || m_singleStepVu0 || m_singleStepVu1) break;
 		if(m_ee->m_EE.m_executor->MustBreak()) break;
 #endif
 	}
@@ -664,14 +657,10 @@ void CPS2VM::UpdateIop()
 		int executed = m_iop->ExecuteCpu(m_singleStepIop ? 1 : m_iopExecutionTicks);
 		if(m_iop->IsCpuIdle())
 		{
-#ifdef PROFILE
 			m_cpuUtilisation.iopIdleTicks += (m_iopExecutionTicks - executed);
-#endif
 			executed = m_iopExecutionTicks;
 		}
-#ifdef PROFILE
 		m_cpuUtilisation.iopTotalTicks += executed;
-#endif
 
 		m_iopExecutionTicks -= executed;
 		m_spuUpdateTicks -= executed;
@@ -790,9 +779,14 @@ void CPS2VM::OnCrtModeChange()
 
 void CPS2VM::EmuThread()
 {
+	CreateVM();
 	fesetround(FE_TOWARDZERO);
 	FpUtils::SetDenormalHandlingMode();
 	CProfiler::GetInstance().SetWorkThread();
+#ifdef __ANDROID__
+	JNIEnv* env = nullptr;
+	Framework::CJavaVM::AttachCurrentThread(&env);
+#endif
 #ifdef PROFILE
 	CProfilerZone profilerZone(m_otherProfilerZone);
 #endif
@@ -849,8 +843,8 @@ void CPS2VM::EmuThread()
 							CProfiler::GetInstance().Reset();
 						}
 
-						m_cpuUtilisation = CPU_UTILISATION_INFO();
 #endif
+						m_cpuUtilisation = CPU_UTILISATION_INFO();
 					}
 					else
 					{
@@ -893,4 +887,7 @@ void CPS2VM::EmuThread()
 		}
 	}
 	static_cast<CEeExecutor*>(m_ee->m_EE.m_executor.get())->RemoveExceptionHandler();
+#ifdef __ANDROID__
+	Framework::CJavaVM::DetachCurrentThread();
+#endif
 }

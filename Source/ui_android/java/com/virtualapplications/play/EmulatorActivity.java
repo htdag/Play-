@@ -1,29 +1,28 @@
 package com.virtualapplications.play;
 
 import android.app.*;
+import android.content.Intent;
 import android.os.*;
 
 import androidx.drawerlayout.widget.DrawerLayout;
+
 import android.util.*;
 import android.view.*;
 import android.widget.*;
 import android.widget.Toast;
-
-import java.util.*;
 
 import static com.virtualapplications.play.Constants.PREF_EMU_GENERAL_SHOWFPS;
 import static com.virtualapplications.play.Constants.PREF_EMU_GENERAL_SHOWVIRTUALPAD;
 
 public class EmulatorActivity extends Activity
 {
-	private SurfaceView _renderView;
-	private Timer _statsTimer = new Timer();
-	private Handler _statsTimerHandler;
+	private static final int _settingsIntentRequestCode = 0xBEEF;
+	private final Handler _statsTimerHandler = new Handler();
+	private Runnable _statsTimerRunnable;
 	private TextView _fpsTextView;
 	private TextView _profileTextView;
 	private boolean _surfaceCreated = false;
 	private boolean _activityRunning = false;
-	private DrawerLayout _drawerLayout;
 	protected EmulatorDrawerFragment _drawerFragment;
 
 	public static void RegisterPreferences()
@@ -40,14 +39,7 @@ public class EmulatorActivity extends Activity
 
 		ThemeManager.applyTheme(this, null);
 		setContentView(R.layout.emulator);
-
-		getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-		getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE |
-				View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION |
-				View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
-				View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
-				View.SYSTEM_UI_FLAG_FULLSCREEN |
-				View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+		setupWindow();
 
 		_drawerFragment = (EmulatorDrawerFragment)getFragmentManager().findFragmentById(R.id.emulator_drawer);
 		_drawerFragment.setEventListener(
@@ -96,12 +88,37 @@ public class EmulatorActivity extends Activity
 						toast.show();
 						_drawerFragment.closeDrawer();
 					}
+
+					@Override
+					public void onSettingsSelected()
+					{
+						Intent intent = new Intent(getApplicationContext(), SettingsActivity.class);
+						startActivityForResult(intent, _settingsIntentRequestCode);
+					}
 				}
 		);
 
 		View fragmentView = findViewById(R.id.emulator_drawer);
-		_drawerLayout = (DrawerLayout)findViewById(R.id.emulator_drawer_layout);
-		_drawerFragment.setUp(fragmentView, _drawerLayout);
+		DrawerLayout drawerLayout = findViewById(R.id.emulator_drawer_layout);
+		_drawerFragment.setUp(fragmentView, drawerLayout);
+
+		_fpsTextView = findViewById(R.id.emulator_fps);
+		_profileTextView = findViewById(R.id.emulator_profile);
+
+		_statsTimerRunnable =
+				() -> {
+					int frames = StatsManager.getFrames();
+					int drawCalls = StatsManager.getDrawCalls();
+					int dcpf = frames != 0 ? drawCalls / frames : 0;
+					_fpsTextView.setText(String.format("%d f/s, %d dc/f", frames, dcpf));
+					if(StatsManager.isProfiling())
+					{
+						String profilingInfo = StatsManager.getProfilingInfo();
+						_profileTextView.setText(profilingInfo);
+					}
+					StatsManager.clearStats();
+					_statsTimerHandler.postDelayed(_statsTimerRunnable, 1000);
+				};
 	}
 
 	@Override
@@ -109,25 +126,45 @@ public class EmulatorActivity extends Activity
 	{
 		super.onPostCreate(savedInstanceState);
 
-		_renderView = (SurfaceView)findViewById(R.id.emulator_view);
-		SurfaceHolder holder = _renderView.getHolder();
+		SurfaceView renderView = findViewById(R.id.emulator_view);
+		SurfaceHolder holder = renderView.getHolder();
 		holder.addCallback(new SurfaceCallback());
 
-		_fpsTextView = (TextView)findViewById(R.id.emulator_fps);
-		_profileTextView = (TextView)findViewById(R.id.emulator_profile);
+		updateOnScreenWidgets();
+	}
 
-		if(!SettingsManager.getPreferenceBoolean(PREF_EMU_GENERAL_SHOWVIRTUALPAD))
+	@Override
+	public void onAttachedToWindow()
+	{
+		super.onAttachedToWindow();
+		if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
 		{
-			View virtualPadView = (View)findViewById(R.id.emulator_virtualpad);
-			virtualPadView.setVisibility(View.GONE);
+			DisplayCutout displayCutout = getWindow().getDecorView().getRootWindowInsets().getDisplayCutout();
+			if(displayCutout != null)
+			{
+				_fpsTextView.setX(displayCutout.getSafeInsetLeft());
+			}
 		}
+	}
 
-		if(
-				SettingsManager.getPreferenceBoolean(PREF_EMU_GENERAL_SHOWFPS) ||
-						StatsManager.isProfiling()
-				)
+	@Override
+	protected void onActivityResult(int requestCode, int resultCode, Intent data)
+	{
+		if(requestCode == _settingsIntentRequestCode)
 		{
-			setupStatsTimer();
+			updateOnScreenWidgets();
+			NativeInterop.notifyPreferencesChanged();
+		}
+		super.onActivityResult(requestCode, resultCode, data);
+	}
+
+	@Override
+	public void onWindowFocusChanged(boolean hasFocus)
+	{
+		super.onWindowFocusChanged(hasFocus);
+		if(hasFocus)
+		{
+			setupWindow();
 		}
 	}
 
@@ -150,7 +187,7 @@ public class EmulatorActivity extends Activity
 	@Override
 	public void onDestroy()
 	{
-		_statsTimer.cancel();
+		stopStatsTimer();
 		super.onDestroy();
 	}
 
@@ -162,9 +199,9 @@ public class EmulatorActivity extends Activity
 			return super.dispatchKeyEvent(event);
 		}
 		int action = event.getAction();
-		if((action == KeyEvent.ACTION_DOWN) || (action == KeyEvent.ACTION_UP))
+		if(action == KeyEvent.ACTION_DOWN || action == KeyEvent.ACTION_UP)
 		{
-			boolean pressed = (action == KeyEvent.ACTION_DOWN);
+			boolean pressed = action == KeyEvent.ACTION_DOWN;
 			switch(event.getKeyCode())
 			{
 			case KeyEvent.KEYCODE_DPAD_UP:
@@ -247,38 +284,25 @@ public class EmulatorActivity extends Activity
 		}
 	}
 
-	private void setupStatsTimer()
+	private void startStatsTimer()
 	{
-		_statsTimerHandler =
-				new Handler()
-				{
-					@Override
-					public void handleMessage(Message message)
-					{
-						int frames = StatsManager.getFrames();
-						int drawCalls = StatsManager.getDrawCalls();
-						int dcpf = (frames != 0) ? (drawCalls / frames) : 0;
-						_fpsTextView.setText(String.format("%d f/s, %d dc/f", frames, dcpf));
-						if(StatsManager.isProfiling())
-						{
-							String profilingInfo = StatsManager.getProfilingInfo();
-							_profileTextView.setText(profilingInfo);
-						}
-						StatsManager.clearStats();
-					}
-				};
+		_statsTimerHandler.postDelayed(_statsTimerRunnable, 1000);
+	}
 
-		_statsTimer.schedule(
-				new TimerTask()
-				{
-					@Override
-					public void run()
-					{
-						_statsTimerHandler.obtainMessage().sendToTarget();
-					}
-				},
-				0,
-				1000);
+	private void stopStatsTimer()
+	{
+		_statsTimerHandler.removeCallbacks(_statsTimerRunnable);
+	}
+
+	private void setupWindow()
+	{
+		getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+		getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE |
+				View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION |
+				View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
+				View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
+				View.SYSTEM_UI_FLAG_FULLSCREEN |
+				View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
 	}
 
 	private void updateVirtualMachineState()
@@ -292,6 +316,23 @@ public class EmulatorActivity extends Activity
 		else
 		{
 			NativeInterop.pauseVirtualMachine();
+		}
+	}
+
+	private void updateOnScreenWidgets()
+	{
+		View virtualPadView = findViewById(R.id.emulator_virtualpad);
+		virtualPadView.setVisibility(SettingsManager.getPreferenceBoolean(PREF_EMU_GENERAL_SHOWVIRTUALPAD) ? View.VISIBLE : View.GONE);
+
+		boolean fpsVisible = SettingsManager.getPreferenceBoolean(PREF_EMU_GENERAL_SHOWFPS) || StatsManager.isProfiling();
+
+		_fpsTextView.setVisibility(fpsVisible ? View.VISIBLE : View.GONE);
+		_profileTextView.setVisibility(fpsVisible ? View.VISIBLE : View.GONE);
+
+		stopStatsTimer();
+		if(fpsVisible)
+		{
+			startStatsTimer();
 		}
 	}
 

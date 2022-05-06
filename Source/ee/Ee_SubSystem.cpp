@@ -1,6 +1,8 @@
 #include "Ee_SubSystem.h"
 #include "EeExecutor.h"
 #include "VuExecutor.h"
+#include "AppConfig.h"
+#include "StdStreamUtils.h"
 #include "../Ps2Const.h"
 #include "../Log.h"
 #include "../states/MemoryStateFile.h"
@@ -39,7 +41,6 @@ CSubSystem::CSubSystem(uint8* iopRam, CIopBios& iopBios)
     , m_dmac(m_ram, m_spr, m_vuMem0, m_EE)
     , m_gif(m_gs, m_dmac, m_ram, m_spr)
     , m_sif(m_dmac, m_ram, iopRam)
-    , m_intc(m_dmac)
     , m_ipu(m_intc)
     , m_timer(m_intc, m_gs)
     , m_MAVU0(PS2::VUMEM0SIZE - 1)
@@ -219,7 +220,9 @@ void CSubSystem::Reset()
 	m_timer.Reset();
 
 	m_os->Initialize();
+	m_os->GetLibMc2().Reset();
 	FillFakeIopRam();
+	//LoadBIOS();
 
 	m_statusRegisterCheckers.clear();
 	m_isIdle = false;
@@ -307,13 +310,16 @@ void CSubSystem::CountTicks(int ticks)
 	}
 	m_dmac.ResumeDMA2();
 	m_dmac.ResumeDMA8();
+	m_gif.CountTicks(ticks);
 	m_ipu.CountTicks(ticks);
+	m_vpu0->GetVif().CountTicks(ticks);
+	m_vpu1->GetVif().CountTicks(ticks);
 	ExecuteIpu();
 	if(!m_EE.m_State.nHasException)
 	{
 		if((m_EE.m_State.nCOP0[CCOP_SCU::STATUS] & CMIPS::STATUS_EXL) == 0)
 		{
-			m_sif.ProcessPackets();
+			m_sif.CountTicks(ticks);
 		}
 	}
 	m_EE.m_State.nCOP0[CCOP_SCU::COUNT] += ticks;
@@ -339,6 +345,7 @@ void CSubSystem::NotifyVBlankStart()
 {
 	m_timer.NotifyVBlankStart();
 	m_intc.AssertLine(CINTC::INTC_LINE_VBLANK_START);
+	m_os->GetLibMc2().NotifyVBlankStart();
 	if(m_os->CheckVBlankFlag())
 	{
 		//Make sure a vblank start interrupt is serviced now because
@@ -372,6 +379,7 @@ void CSubSystem::SaveState(Framework::CZipArchiveWriter& archive)
 	m_vpu1->SaveState(archive);
 	m_timer.SaveState(archive);
 	m_gif.SaveState(archive);
+	m_os->GetLibMc2().SaveState(archive);
 }
 
 void CSubSystem::LoadState(Framework::CZipArchiveReader& archive)
@@ -395,6 +403,7 @@ void CSubSystem::LoadState(Framework::CZipArchiveReader& archive)
 	m_vpu1->LoadState(archive);
 	m_timer.LoadState(archive);
 	m_gif.LoadState(archive);
+	m_os->GetLibMc2().LoadState(archive);
 }
 
 void CSubSystem::SetupEePageTable()
@@ -453,7 +462,7 @@ uint32 CSubSystem::IOPortReadHandler(uint32 nAddress)
 		                         nAddress, m_EE.m_State.nPC);
 	}
 
-	if((nAddress == CINTC::INTC_STAT) || (nAddress == CGSHandler::GS_CSR))
+	if((nAddress == CINTC::INTC_STAT) || (nAddress == CGSHandler::GS_CSR) || (nAddress == CTimer::T1_COUNT))
 	{
 		//Some games will loop checking for the vblank start interrupt or vblank event
 		//This is usually a good sign indicating that the game is idling
@@ -556,8 +565,9 @@ uint32 CSubSystem::IOPortWriteHandler(uint32 nAddress, uint32 nData)
 		                         nAddress, nData, m_EE.m_State.nPC);
 	}
 
+	bool isInterruptPending = m_intc.IsInterruptPending() || m_dmac.IsInterruptPending();
 	if(
-	    m_intc.IsInterruptPending() &&
+	    isInterruptPending &&
 	    (m_EE.m_State.nHasException == MIPS_EXCEPTION_NONE) &&
 	    ((m_EE.m_State.nCOP0[CCOP_SCU::STATUS] & INTERRUPTS_ENABLED_MASK) == INTERRUPTS_ENABLED_MASK))
 	{
@@ -569,7 +579,7 @@ uint32 CSubSystem::IOPortWriteHandler(uint32 nAddress, uint32 nData)
 
 uint32 CSubSystem::Vu0MicroMemWriteHandler(uint32 address, uint32 value)
 {
-	uint32 baseAddress = address - PS2::MICROMEM0ADDR;
+	uint32 baseAddress = (address - PS2::MICROMEM0ADDR) & ~0x03;
 	*reinterpret_cast<uint32*>(m_microMem0 + baseAddress) = value;
 	m_vpu0->InvalidateMicroProgram(baseAddress, baseAddress + 4);
 	return 0;
@@ -616,7 +626,7 @@ void CSubSystem::Vu0StateChanged(bool running)
 
 uint32 CSubSystem::Vu1MicroMemWriteHandler(uint32 address, uint32 value)
 {
-	uint32 baseAddress = address - PS2::MICROMEM1ADDR;
+	uint32 baseAddress = (address - PS2::MICROMEM1ADDR) & ~0x03;
 	*reinterpret_cast<uint32*>(m_microMem1 + baseAddress) = value;
 	m_vpu1->InvalidateMicroProgram(baseAddress, baseAddress + 4);
 	return 0;
@@ -660,8 +670,11 @@ void CSubSystem::CopyVuState(CMIPS& dst, const CMIPS& src)
 	memcpy(&dst.m_State.nCOP2, &src.m_State.nCOP2, sizeof(dst.m_State.nCOP2));
 	memcpy(&dst.m_State.nCOP2A, &src.m_State.nCOP2A, sizeof(dst.m_State.nCOP2A));
 	memcpy(&dst.m_State.nCOP2VI, &src.m_State.nCOP2VI, sizeof(dst.m_State.nCOP2VI));
+	dst.m_State.nCOP2Q = src.m_State.nCOP2Q;
 	dst.m_State.nCOP2SF = src.m_State.nCOP2SF;
 	dst.m_State.nCOP2CF = src.m_State.nCOP2CF;
+	dst.m_State.pipeQ.counter = 0;
+	dst.m_State.pipeQ.heldValue = src.m_State.nCOP2Q;
 	for(unsigned int i = 0; i < FLAG_PIPELINE_SLOTS; i++)
 	{
 		dst.m_State.pipeClip.pipeTimes[i] = 0;
@@ -702,15 +715,24 @@ void CSubSystem::CheckPendingInterrupts()
 {
 	if(!m_EE.m_State.nHasException)
 	{
+		int32 cpuIntLine = -1;
+		if(m_intc.IsInterruptPending())
+		{
+			cpuIntLine = 0;
+		}
+		else if(m_dmac.IsInterruptPending())
+		{
+			cpuIntLine = 1;
+		}
 		if(
-		    m_intc.IsInterruptPending()
+		    (cpuIntLine != -1)
 #ifdef DEBUGGER_INCLUDED
 		    //			&& !m_singleStepEe
 		    && !m_EE.m_executor->MustBreak()
 #endif
 		)
 		{
-			m_os->HandleInterrupt();
+			m_os->HandleInterrupt(cpuIntLine);
 		}
 	}
 }
@@ -722,8 +744,9 @@ void CSubSystem::FlushInstructionCache()
 
 void CSubSystem::LoadBIOS()
 {
-	Framework::CStdStream BiosStream(fopen("./vfs/rom0/scph10000.bin", "rb"));
-	BiosStream.Read(m_bios, PS2::EE_BIOS_SIZE);
+	auto biosPath = CAppConfig::GetBasePath() / "bios/scph10000.bin";
+	auto biosStream = Framework::CreateInputStdStream(biosPath.native());
+	biosStream.Read(m_bios, PS2::EE_BIOS_SIZE);
 }
 
 void CSubSystem::FillFakeIopRam()

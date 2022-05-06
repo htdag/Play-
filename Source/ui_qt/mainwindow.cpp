@@ -36,8 +36,10 @@
 #include "tools/PsfPlayer/Source/SH_OpenAL.h"
 #endif
 #ifdef DEBUGGER_INCLUDED
+#include "DebugSupport/DebugSupportSettings.h"
 #include "DebugSupport/QtDebugger.h"
 #include "DebugSupport/FrameDebugger/QtFramedebugger.h"
+#include "ui_debugdockmenu.h"
 #include "ui_debugmenu.h"
 #endif
 #include "input/PH_GenericInput.h"
@@ -52,8 +54,8 @@
 
 #include "ui_mainwindow.h"
 #include "vfsmanagerdialog.h"
-#include "bootablelistdialog.h"
 #include "ControllerConfig/controllerconfigdialog.h"
+#include "QBootablesView.h"
 
 #ifdef __APPLE__
 #include "macos/InputProviderMacOsHid.h"
@@ -102,26 +104,19 @@ MainWindow::MainWindow(QWidget* parent)
 	CreateStatusBar();
 	UpdateUI();
 	addAction(ui->actionPause_Resume);
+	SetupBootableView();
+
 #ifdef HAS_AMAZON_S3
 	ui->actionBoot_DiscImage_S3->setVisible(S3FileBrowser::IsAvailable());
 #endif
 	InitVirtualMachine();
 	SetupGsHandler();
+	SetupDebugger();
 
-#ifdef DEBUGGER_INCLUDED
-	m_debugger = std::make_unique<QtDebugger>(*m_virtualMachine);
-	m_frameDebugger = std::make_unique<QtFramedebugger>();
-
-	auto debugMenu = new QMenu(this);
-	debugMenuUi = new Ui::DebugMenu();
-	debugMenuUi->setupUi(debugMenu);
-	ui->menuBar->insertMenu(ui->menuHelp->menuAction(), debugMenu);
-
-	connect(debugMenuUi->actionShowDebugger, &QAction::triggered, this, std::bind(&MainWindow::ShowDebugger, this));
-	connect(debugMenuUi->actionShowFrameDebugger, &QAction::triggered, this, std::bind(&MainWindow::ShowFrameDebugger, this));
-	connect(debugMenuUi->actionDumpNextFrame, &QAction::triggered, this, std::bind(&MainWindow::DumpNextFrame, this));
-	connect(debugMenuUi->actionGsDrawEnabled, &QAction::triggered, this, std::bind(&MainWindow::ToggleGsDraw, this));
-#endif
+	m_onRunningStateChangeConnection = m_virtualMachine->OnRunningStateChange.Connect([&] {
+		if(m_virtualMachine->GetStatus() == CVirtualMachine::RUNNING)
+			ui->stackedWidget->setCurrentIndex(1);
+	});
 }
 
 MainWindow::~MainWindow()
@@ -142,8 +137,9 @@ MainWindow::~MainWindow()
 		delete m_virtualMachine;
 		m_virtualMachine = nullptr;
 	}
-#ifdef DEBUGGER_INCLUDED
 	delete ui;
+#ifdef DEBUGGER_INCLUDED
+	delete debugDockMenuUi;
 	delete debugMenuUi;
 #endif
 }
@@ -185,7 +181,7 @@ void MainWindow::InitVirtualMachine()
 	}
 
 #ifdef PROFILE
-	m_profileFrameDoneConnection = m_virtualMachine->ProfileFrameDone.Connect(std::bind(&CStatsManager::OnProfileFrameDone, &CStatsManager::GetInstance(), m_virtualMachine, std::placeholders::_1));
+	m_profileFrameDoneConnection = m_virtualMachine->ProfileFrameDone.Connect(std::bind(&CStatsManager::OnProfileFrameDone, &CStatsManager::GetInstance(), std::placeholders::_1));
 #endif
 
 	//OnExecutableChange might be called from another thread, we need to wrap it around a Qt signal
@@ -210,7 +206,7 @@ void MainWindow::SetupGsHandler()
 		m_outputwindow = new VulkanWindow;
 		QWidget* container = QWidget::createWindowContainer(m_outputwindow);
 		m_outputwindow->create();
-		ui->gridLayout->addWidget(container, 0, 0);
+		ui->stackedWidget->addWidget(container);
 		m_virtualMachine->CreateGSHandler(CGSH_VulkanQt::GetFactoryFunction(m_outputwindow));
 	}
 	break;
@@ -221,9 +217,15 @@ void MainWindow::SetupGsHandler()
 		m_outputwindow = new OpenGLWindow;
 		QWidget* container = QWidget::createWindowContainer(m_outputwindow);
 		m_outputwindow->create();
-		ui->gridLayout->addWidget(container, 0, 0);
+		ui->stackedWidget->addWidget(container);
 		m_virtualMachine->CreateGSHandler(CGSH_OpenGLQt::GetFactoryFunction(m_outputwindow));
 	}
+	}
+	if(ui->stackedWidget->count() > 2)
+	{
+		auto oldContainer = ui->stackedWidget->widget(1);
+		ui->stackedWidget->removeWidget(oldContainer);
+		delete oldContainer;
 	}
 
 	connect(m_outputwindow, SIGNAL(heightChanged(int)), this, SLOT(outputWindow_resized()));
@@ -237,7 +239,7 @@ void MainWindow::SetupGsHandler()
 
 	connect(m_outputwindow, SIGNAL(doubleClick(QMouseEvent*)), this, SLOT(doubleClickEvent(QMouseEvent*)));
 
-	m_OnNewFrameConnection = m_virtualMachine->m_ee->m_gs->OnNewFrame.Connect(std::bind(&CStatsManager::OnNewFrame, &CStatsManager::GetInstance(), std::placeholders::_1));
+	m_OnNewFrameConnection = m_virtualMachine->m_ee->m_gs->OnNewFrame.Connect(std::bind(&CStatsManager::OnNewFrame, &CStatsManager::GetInstance(), m_virtualMachine, std::placeholders::_1));
 }
 
 void MainWindow::SetupSoundHandler()
@@ -453,6 +455,10 @@ void MainWindow::CreateStatusBar()
 	m_fpsLabel->setAlignment(Qt::AlignHCenter);
 	m_fpsLabel->setMinimumSize(m_fpsLabel->sizeHint());
 
+	m_cpuUsageLabel = new QLabel("");
+	m_cpuUsageLabel->setAlignment(Qt::AlignHCenter);
+	m_cpuUsageLabel->setMinimumSize(m_cpuUsageLabel->sizeHint());
+
 	m_msgLabel = new ElidedLabel();
 	m_msgLabel->setAlignment(Qt::AlignLeft);
 	QFontMetrics fm(m_msgLabel->font());
@@ -461,6 +467,7 @@ void MainWindow::CreateStatusBar()
 
 	statusBar()->addWidget(m_msgLabel, 1);
 	statusBar()->addWidget(m_fpsLabel);
+	statusBar()->addWidget(m_cpuUsageLabel);
 #ifdef HAS_GSH_VULKAN
 	if(GSH_Vulkan::CDeviceInfo::GetInstance().HasAvailableDevices())
 	{
@@ -487,17 +494,24 @@ void MainWindow::CreateStatusBar()
 	m_fpsTimer = new QTimer(this);
 	connect(m_fpsTimer, SIGNAL(timeout()), this, SLOT(updateStats()));
 	m_fpsTimer->start(1000);
+
+	UpdateCpuUsageLabel();
 }
 
 void MainWindow::updateStats()
 {
 	uint32 frames = CStatsManager::GetInstance().GetFrames();
 	uint32 drawCalls = CStatsManager::GetInstance().GetDrawCalls();
+	auto cpuUtilisation = CStatsManager::GetInstance().GetCpuUtilisationInfo();
 	uint32 dcpf = (frames != 0) ? (drawCalls / frames) : 0;
 #ifdef PROFILE
 	m_profileStatsLabel->setText(QString::fromStdString(CStatsManager::GetInstance().GetProfilingInfo()));
 #endif
 	m_fpsLabel->setText(QString("%1 f/s, %2 dc/f").arg(frames).arg(dcpf));
+
+	auto eeUsageRatio = CStatsManager::ComputeCpuUsageRatio(cpuUtilisation.eeIdleTicks, cpuUtilisation.eeTotalTicks);
+	m_cpuUsageLabel->setText(QString("EE CPU: %1%").arg(static_cast<int>(eeUsageRatio)));
+
 	CStatsManager::GetInstance().ClearStats();
 }
 
@@ -511,6 +525,7 @@ void MainWindow::on_actionSettings_triggered()
 	{
 		m_virtualMachine->ReloadSpuBlockCount();
 		m_virtualMachine->ReloadFrameRateLimit();
+		UpdateCpuUsageLabel();
 		auto new_gs_index = CAppConfig::GetInstance().GetPreferenceInteger(PREF_VIDEO_GS_HANDLER);
 		if(gs_index != new_gs_index)
 		{
@@ -629,10 +644,22 @@ void MainWindow::on_actionPause_Resume_triggered()
 
 void MainWindow::closeEvent(QCloseEvent* event)
 {
-	QMessageBox::StandardButton resBtn = QMessageBox::question(this, "Close Confirmation?",
-	                                                           tr("Are you sure you want to exit?\nHave you saved your progress?\n"),
-	                                                           QMessageBox::Yes | QMessageBox::No,
-	                                                           QMessageBox::Yes);
+	QMessageBox::StandardButton resBtn;
+	if(!ui->bootablesView->IsProcessing())
+	{
+		resBtn = QMessageBox::question(this, "Close Confirmation?",
+		                               tr("Are you sure you want to exit?\nHave you saved your progress?\n"),
+		                               QMessageBox::Yes | QMessageBox::No,
+		                               QMessageBox::Yes);
+	}
+	else
+	{
+		resBtn = QMessageBox::question(this, "Close Confirmation?",
+		                               tr("Are you sure you want to exit?\nBootables are currently getting processed.\n"),
+		                               QMessageBox::Yes | QMessageBox::No,
+		                               QMessageBox::Yes);
+	}
+
 	if(resBtn != QMessageBox::Yes)
 	{
 		event->ignore();
@@ -664,6 +691,7 @@ void MainWindow::HandleOnExecutableChange()
 	UpdateUI();
 	auto titleString = QString("Play! - [ %1 ] - %2").arg(m_virtualMachine->m_ee->m_os->GetExecutableName(), QString(PLAY_VERSION));
 	setWindowTitle(titleString);
+	ui->bootablesView->AsyncResetModel(true);
 }
 
 bool MainWindow::IsExecutableLoaded() const
@@ -680,10 +708,17 @@ void MainWindow::UpdateUI()
 	SetupSaveLoadStateSlots();
 }
 
+void MainWindow::UpdateCpuUsageLabel()
+{
+	bool visible = CAppConfig::GetInstance().GetPreferenceBoolean(PREF_UI_SHOWEECPUUSAGE);
+	m_cpuUsageLabel->setVisible(visible);
+}
+
 void MainWindow::RegisterPreferences()
 {
 	CAppConfig::GetInstance().RegisterPreferenceBoolean(PREFERENCE_AUDIO_ENABLEOUTPUT, true);
 	CAppConfig::GetInstance().RegisterPreferenceBoolean(PREF_UI_PAUSEWHENFOCUSLOST, true);
+	CAppConfig::GetInstance().RegisterPreferenceBoolean(PREF_UI_SHOWEECPUUSAGE, false);
 	CAppConfig::GetInstance().RegisterPreferenceInteger(PREF_VIDEO_GS_HANDLER, SettingsDialog::GS_HANDLERS::OPENGL);
 	CAppConfig::GetInstance().RegisterPreferenceString(PREF_INPUT_PAD1_PROFILE, "default");
 }
@@ -793,14 +828,25 @@ void MainWindow::resizeWindow(unsigned int width, unsigned int height)
 
 #ifdef DEBUGGER_INCLUDED
 
+void MainWindow::ShowMainWindow()
+{
+	show();
+	raise();
+	activateWindow();
+}
+
 void MainWindow::ShowDebugger()
 {
 	m_debugger->showMaximized();
+	m_debugger->raise();
+	m_debugger->activateWindow();
 }
 
 void MainWindow::ShowFrameDebugger()
 {
 	m_frameDebugger->show();
+	m_frameDebugger->raise();
+	m_frameDebugger->activateWindow();
 }
 
 fs::path MainWindow::GetFrameDumpDirectoryPath()
@@ -900,36 +946,7 @@ void MainWindow::on_actionCapture_Screen_triggered()
 
 void MainWindow::on_actionList_Bootables_triggered()
 {
-	BootableListDialog dialog(this);
-	if(dialog.exec())
-	{
-		try
-		{
-			BootablesDb::Bootable bootable = dialog.getResult();
-			if(IsBootableDiscImagePath(bootable.path))
-			{
-				LoadCDROM(bootable.path);
-				BootCDROM();
-			}
-			else if(IsBootableExecutablePath(bootable.path))
-			{
-				BootElf(bootable.path);
-			}
-			else
-			{
-				QMessageBox messageBox;
-				QString invalid("Invalid File Format.");
-				messageBox.critical(this, this->windowTitle(), invalid);
-				messageBox.show();
-			}
-		}
-		catch(const std::exception& e)
-		{
-			QMessageBox messageBox;
-			messageBox.critical(nullptr, "Error", e.what());
-			messageBox.show();
-		}
-	}
+	ui->stackedWidget->setCurrentIndex(1 - ui->stackedWidget->currentIndex());
 }
 
 void MainWindow::UpdateGSHandlerLabel(int gs_index)
@@ -946,4 +963,79 @@ void MainWindow::UpdateGSHandlerLabel(int gs_index)
 		break;
 #endif
 	}
+}
+
+void MainWindow::SetupBootableView()
+{
+	auto showEmu = std::bind(&QStackedWidget::setCurrentIndex, ui->stackedWidget, 1);
+	QBootablesView* bootablesView = ui->bootablesView;
+
+	bootablesView->AddMsgLabel(m_msgLabel);
+
+	QBootablesView::BootCallback bootGameCallback = [&, showEmu](fs::path filePath) {
+		try
+		{
+			if(IsBootableDiscImagePath(filePath))
+			{
+				LoadCDROM(filePath);
+				BootCDROM();
+			}
+			else if(IsBootableExecutablePath(filePath))
+			{
+				BootElf(filePath);
+			}
+			else
+			{
+				QMessageBox messageBox;
+				QString invalid("Invalid File Format.");
+				messageBox.critical(this, this->windowTitle(), invalid);
+				messageBox.show();
+			}
+			showEmu();
+		}
+		catch(const std::exception& e)
+		{
+			QMessageBox messageBox;
+			messageBox.critical(nullptr, "Error", e.what());
+			messageBox.show();
+		}
+	};
+	bootablesView->SetupActions(bootGameCallback);
+}
+
+void MainWindow::SetupDebugger()
+{
+#ifdef DEBUGGER_INCLUDED
+	CDebugSupportSettings::GetInstance().Initialize(&CAppConfig::GetInstance());
+
+	m_debugger = std::make_unique<QtDebugger>(*m_virtualMachine);
+	m_frameDebugger = std::make_unique<QtFramedebugger>();
+
+	{
+		auto debugMenu = new QMenu(this);
+		debugMenuUi = new Ui::DebugMenu();
+		debugMenuUi->setupUi(debugMenu);
+		ui->menuBar->insertMenu(ui->menuHelp->menuAction(), debugMenu);
+
+		connect(debugMenuUi->actionShowDebugger, &QAction::triggered, this, std::bind(&MainWindow::ShowDebugger, this));
+		connect(debugMenuUi->actionShowFrameDebugger, &QAction::triggered, this, std::bind(&MainWindow::ShowFrameDebugger, this));
+		connect(debugMenuUi->actionDumpNextFrame, &QAction::triggered, this, std::bind(&MainWindow::DumpNextFrame, this));
+		connect(debugMenuUi->actionGsDrawEnabled, &QAction::triggered, this, std::bind(&MainWindow::ToggleGsDraw, this));
+	}
+
+#if defined(__APPLE__)
+	{
+		auto debugDockMenu = new QMenu(this);
+		debugDockMenuUi = new Ui::DebugDockMenu();
+		debugDockMenuUi->setupUi(debugDockMenu);
+
+		connect(debugDockMenuUi->actionShowMainWindow, &QAction::triggered, this, std::bind(&MainWindow::ShowMainWindow, this));
+		connect(debugDockMenuUi->actionShowDebugger, &QAction::triggered, this, std::bind(&MainWindow::ShowDebugger, this));
+		connect(debugDockMenuUi->actionShowFrameDebugger, &QAction::triggered, this, std::bind(&MainWindow::ShowFrameDebugger, this));
+
+		debugDockMenu->setAsDockMenu();
+	}
+#endif //defined(__APPLE__)
+
+#endif //DEBUGGER_INCLUDED
 }

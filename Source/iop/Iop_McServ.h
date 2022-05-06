@@ -32,6 +32,8 @@ namespace Iop
 			CMD_ID_GETDIR = 0x0D,
 			CMD_ID_SETFILEINFO = 0x0E,
 			CMD_ID_DELETE = 0x0F,
+			CMD_ID_GETENTSPACE = 0x12,
+			CMD_ID_SETTHREADPRIORITY = 0x14,
 		};
 
 		enum OPEN_FLAGS
@@ -118,6 +120,8 @@ namespace Iop
 		virtual ~CMcServ() = default;
 
 		static const char* GetMcPathPreference(unsigned int);
+		static std::string EncodeMcName(const std::string&);
+		static std::string DecodeMcName(const std::string&);
 
 		std::string GetId() const override;
 		std::string GetFunctionName(unsigned int) const override;
@@ -158,6 +162,7 @@ namespace Iop
 		{
 			MAX_FILES = 5,
 			MAX_PORTS = 2,
+			MAX_SLOTS = 1,
 		};
 
 		class CPathFinder
@@ -174,6 +179,7 @@ namespace Iop
 			typedef std::vector<ENTRY> EntryList;
 
 			void SearchRecurse(const fs::path&);
+			uint32 CountEntries(const fs::path&);
 
 			EntryList m_entries;
 			fs::path m_basePath;
@@ -196,10 +202,13 @@ namespace Iop
 		void Delete(uint32*, uint32, uint32*, uint32, uint8*);
 		void SetFileInfo(uint32*, uint32, uint32*, uint32, uint8*);
 		void GetEntSpace(uint32*, uint32, uint32*, uint32, uint8*);
+		void SetThreadPriority(uint32*, uint32, uint32*, uint32, uint8*);
 		void GetSlotMax(uint32*, uint32, uint32*, uint32, uint8*);
 		bool ReadFast(uint32*, uint32, uint32*, uint32, uint8*);
 		void WriteFast(uint32*, uint32, uint32*, uint32, uint8*);
 		void GetVersionInformation(uint32*, uint32, uint32*, uint32, uint8*);
+
+		bool HandleInvalidPortOrSlot(uint32, uint32, uint32*);
 
 		void StartReadFast(CMIPS&);
 		void ProceedReadFast(CMIPS&);
@@ -220,8 +229,8 @@ namespace Iop
 		uint32 m_finishReadFastAddr = 0;
 		uint32 m_readFastAddr = 0;
 		Framework::CStdStream m_files[MAX_FILES];
-		static const char* m_mcPathPreference[2];
-		std::string m_currentDirectory;
+		static const char* m_mcPathPreference[MAX_PORTS];
+		std::string m_currentDirectory[MAX_PORTS];
 		CPathFinder m_pathFinder;
 
 		// Keeps track, if the memory card in

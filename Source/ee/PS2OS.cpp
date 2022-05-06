@@ -63,8 +63,9 @@
 #define BIOS_ADDRESS_DMACHANDLERQUEUE_BASE 0x00000028
 #define BIOS_ADDRESS_TLB_READEXCEPTION_HANDLER 0x0000002C
 #define BIOS_ADDRESS_TLB_WRITEEXCEPTION_HANDLER 0x00000030
-#define BIOS_ADDRESS_SIFDMA_NEXT_INDEX 0x00000034
-#define BIOS_ADDRESS_SIFDMA_TIMES_BASE 0x00000038
+#define BIOS_ADDRESS_TRAPEXCEPTION_HANDLER 0x00000034
+#define BIOS_ADDRESS_SIFDMA_NEXT_INDEX 0x00000038
+#define BIOS_ADDRESS_SIFDMA_TIMES_BASE 0x0000003C
 #define BIOS_ADDRESS_SIFDMA_TIMES_END (BIOS_ADDRESS_SIFDMA_TIMES_BASE + (4 * BIOS_SIFDMA_COUNT))
 #define BIOS_ADDRESS_INTERRUPT_THREAD_CONTEXT BIOS_ADDRESS_SIFDMA_TIMES_END
 #define BIOS_ADDRESS_INTCHANDLER_BASE 0x0000A000
@@ -241,7 +242,7 @@ CPS2OS::CPS2OS(CMIPS& ee, uint8* ram, uint8* bios, uint8* spr, CGSHandler*& gs, 
     , m_bios(bios)
     , m_spr(spr)
     , m_sif(sif)
-    , m_libMc2(ram, iopBios)
+    , m_libMc2(ram, *this, iopBios)
     , m_iopBios(iopBios)
     , m_threads(reinterpret_cast<THREAD*>(m_ram + BIOS_ADDRESS_THREAD_BASE), BIOS_ID_BASE, MAX_THREAD)
     , m_semaphores(reinterpret_cast<SEMAPHORE*>(m_ram + BIOS_ADDRESS_SEMAPHORE_BASE), SEMA_ID_BASE, MAX_SEMAPHORE)
@@ -252,6 +253,7 @@ CPS2OS::CPS2OS(CMIPS& ee, uint8* ram, uint8* bios, uint8* spr, CGSHandler*& gs, 
     , m_idleThreadId(reinterpret_cast<uint32*>(m_ram + BIOS_ADDRESS_IDLE_THREAD_ID))
     , m_tlblExceptionHandler(reinterpret_cast<uint32*>(m_ram + BIOS_ADDRESS_TLB_READEXCEPTION_HANDLER))
     , m_tlbsExceptionHandler(reinterpret_cast<uint32*>(m_ram + BIOS_ADDRESS_TLB_WRITEEXCEPTION_HANDLER))
+    , m_trapExceptionHandler(reinterpret_cast<uint32*>(m_ram + BIOS_ADDRESS_TRAPEXCEPTION_HANDLER))
     , m_sifDmaNextIdx(reinterpret_cast<uint32*>(m_ram + BIOS_ADDRESS_SIFDMA_NEXT_INDEX))
     , m_sifDmaTimes(reinterpret_cast<uint32*>(m_ram + BIOS_ADDRESS_SIFDMA_TIMES_BASE))
     , m_threadSchedule(m_threads, reinterpret_cast<uint32*>(m_ram + BIOS_ADDRESS_THREADSCHEDULE_BASE))
@@ -271,6 +273,7 @@ CPS2OS::~CPS2OS()
 void CPS2OS::Initialize()
 {
 	m_elf = nullptr;
+	m_idleEvaluator.Reset();
 
 	SetVsyncFlagPtrs(0, 0);
 	UpdateTLBEnabledState();
@@ -287,7 +290,8 @@ void CPS2OS::Initialize()
 	m_ee.m_State.nPC = BIOS_ADDRESS_IDLETHREADPROC;
 	m_ee.m_State.nCOP0[CCOP_SCU::STATUS] |= (CMIPS::STATUS_IE | CMIPS::STATUS_EIE);
 
-	//The BIOS enables TIMER3 for alarm purposes, some games (ex.: SoulCalibur 3) assume timer is counting.
+	//The BIOS enables TIMER2 and TIMER3 for alarm purposes and others, some games (ex.: SoulCalibur 3, Ape Escape 2) assume timer is counting.
+	m_ee.m_pMemoryMap->SetWord(CTimer::T2_MODE, CTimer::MODE_COUNT_ENABLE | CTimer::MODE_EQUAL_FLAG | CTimer::MODE_OVERFLOW_FLAG);
 	m_ee.m_pMemoryMap->SetWord(CTimer::T3_MODE, CTimer::MODE_CLOCK_SELECT_EXTERNAL | CTimer::MODE_COUNT_ENABLE | CTimer::MODE_EQUAL_FLAG | CTimer::MODE_OVERFLOW_FLAG);
 }
 
@@ -299,7 +303,7 @@ void CPS2OS::Release()
 bool CPS2OS::IsIdle() const
 {
 	return m_ee.CanGenerateInterrupt() &&
-	       (m_currentThreadId == m_idleThreadId);
+	       ((m_currentThreadId == m_idleThreadId) || m_idleEvaluator.IsIdle());
 }
 
 void CPS2OS::DumpIntcHandlers()
@@ -412,11 +416,11 @@ std::pair<uint32, uint32> CPS2OS::GetExecutableRange() const
 {
 	uint32 minAddr = 0xFFFFFFF0;
 	uint32 maxAddr = 0x00000000;
-	const ELFHEADER& header = m_elf->GetHeader();
+	const auto& header = m_elf->GetHeader();
 
 	for(unsigned int i = 0; i < header.nProgHeaderCount; i++)
 	{
-		ELFPROGRAMHEADER* p = m_elf->GetProgram(i);
+		auto p = m_elf->GetProgram(i);
 		if(p != NULL)
 		{
 			//Wild Arms: Alter Code F has zero sized program headers
@@ -476,7 +480,7 @@ void CPS2OS::LoadELF(Framework::CStream& stream, const char* executablePath, con
 void CPS2OS::LoadExecutableInternal()
 {
 	//Copy program in main RAM
-	const ELFHEADER& header = m_elf->GetHeader();
+	const auto& header = m_elf->GetHeader();
 	for(unsigned int i = 0; i < header.nProgHeaderCount; i++)
 	{
 		auto p = m_elf->GetProgram(i);
@@ -492,6 +496,7 @@ void CPS2OS::LoadExecutableInternal()
 	}
 
 	m_ee.m_State.nPC = header.nEntryPoint;
+	m_ee.m_State.nGPR[CMIPS::A0].nV[0] = header.nEntryPoint;
 
 #ifdef DEBUGGER_INCLUDED
 	std::pair<uint32, uint32> executableRange = GetExecutableRange();
@@ -694,6 +699,9 @@ void CPS2OS::AssembleInterruptHandler()
 {
 	CEEAssembler assembler(reinterpret_cast<uint32*>(&m_bios[BIOS_ADDRESS_INTERRUPTHANDLER - BIOS_ADDRESS_BASE]));
 
+	auto processDmacLabel = assembler.CreateLabel();
+	auto doneLabel = assembler.CreateLabel();
+
 	const uint32 stackFrameSize = 0x230;
 
 	//Invariant - Current thread is idle thread
@@ -717,66 +725,73 @@ void CPS2OS::AssembleInterruptHandler()
 	assembler.AND(CMIPS::T0, CMIPS::T0, CMIPS::T1);
 	assembler.MTC0(CMIPS::T0, CCOP_SCU::STATUS);
 
-	//Get INTC status
-	assembler.LI(CMIPS::T0, CINTC::INTC_STAT);
-	assembler.LW(CMIPS::S0, 0x0000, CMIPS::T0);
-
-	//Get INTC mask
-	assembler.LI(CMIPS::T1, CINTC::INTC_MASK);
-	assembler.LW(CMIPS::S1, 0x0000, CMIPS::T1);
-
-	//Get cause
-	assembler.AND(CMIPS::S0, CMIPS::S0, CMIPS::S1);
-
-	//Clear cause
-	//assembler.SW(CMIPS::S0, 0x0000, CMIPS::T0);
+	//Get CAUSE register
+	assembler.MFC0(CMIPS::T0, CCOP_SCU::CAUSE);
+	assembler.ADDIU(CMIPS::T1, CMIPS::R0, CCOP_SCU::CAUSE_IP_3);
+	assembler.AND(CMIPS::T0, CMIPS::T0, CMIPS::T1);
+	assembler.BNE(CMIPS::T0, CMIPS::R0, processDmacLabel);
 	assembler.NOP();
 
-	static const auto generateIntHandler =
-	    [](CMIPSAssembler& assembler, uint32 line) {
-		    auto skipIntHandlerLabel = assembler.CreateLabel();
-
-		    //Check cause
-		    assembler.ANDI(CMIPS::T0, CMIPS::S0, (1 << line));
-		    assembler.BEQ(CMIPS::R0, CMIPS::T0, skipIntHandlerLabel);
-		    assembler.NOP();
-
-		    //Process handlers
-		    assembler.ADDIU(CMIPS::A0, CMIPS::R0, line);
-		    assembler.JAL(BIOS_ADDRESS_INTCHANDLER);
-		    assembler.NOP();
-
-		    assembler.MarkLabel(skipIntHandlerLabel);
-	    };
-
-	generateIntHandler(assembler, CINTC::INTC_LINE_GS);
-
+	//Process INTC interrupt
 	{
-		auto skipIntHandlerLabel = assembler.CreateLabel();
+		//Get INTC status
+		assembler.LI(CMIPS::T0, CINTC::INTC_STAT);
+		assembler.LW(CMIPS::S0, 0x0000, CMIPS::T0);
 
-		//Check if INT1 (DMAC)
-		assembler.ANDI(CMIPS::T0, CMIPS::S0, (1 << CINTC::INTC_LINE_DMAC));
-		assembler.BEQ(CMIPS::R0, CMIPS::T0, skipIntHandlerLabel);
+		//Get INTC mask
+		assembler.LI(CMIPS::T1, CINTC::INTC_MASK);
+		assembler.LW(CMIPS::S1, 0x0000, CMIPS::T1);
+
+		//Get cause
+		assembler.AND(CMIPS::S0, CMIPS::S0, CMIPS::S1);
+
+		static const auto generateIntHandler =
+		    [](CMIPSAssembler& assembler, uint32 line) {
+			    auto skipIntHandlerLabel = assembler.CreateLabel();
+
+			    //Check cause
+			    assembler.ANDI(CMIPS::T0, CMIPS::S0, (1 << line));
+			    assembler.BEQ(CMIPS::R0, CMIPS::T0, skipIntHandlerLabel);
+			    assembler.NOP();
+
+			    //Process handlers
+			    assembler.ADDIU(CMIPS::A0, CMIPS::R0, line);
+			    assembler.JAL(BIOS_ADDRESS_INTCHANDLER);
+			    assembler.NOP();
+
+			    if(line == CINTC::INTC_LINE_TIMER3)
+			    {
+				    assembler.JAL(BIOS_ADDRESS_ALARMHANDLER);
+				    assembler.NOP();
+			    }
+
+			    assembler.MarkLabel(skipIntHandlerLabel);
+		    };
+
+		generateIntHandler(assembler, CINTC::INTC_LINE_GS);
+		generateIntHandler(assembler, CINTC::INTC_LINE_VBLANK_START);
+		generateIntHandler(assembler, CINTC::INTC_LINE_VBLANK_END);
+		generateIntHandler(assembler, CINTC::INTC_LINE_VIF0);
+		generateIntHandler(assembler, CINTC::INTC_LINE_VIF1);
+		generateIntHandler(assembler, CINTC::INTC_LINE_IPU);
+		generateIntHandler(assembler, CINTC::INTC_LINE_TIMER0);
+		generateIntHandler(assembler, CINTC::INTC_LINE_TIMER1);
+		generateIntHandler(assembler, CINTC::INTC_LINE_TIMER2);
+		generateIntHandler(assembler, CINTC::INTC_LINE_TIMER3);
+
+		assembler.BEQ(CMIPS::R0, CMIPS::R0, doneLabel);
 		assembler.NOP();
-
-		//Go to DMAC interrupt handler
-		assembler.JAL(BIOS_ADDRESS_DMACHANDLER);
-		assembler.NOP();
-
-		assembler.MarkLabel(skipIntHandlerLabel);
 	}
 
-	generateIntHandler(assembler, CINTC::INTC_LINE_VBLANK_START);
-	generateIntHandler(assembler, CINTC::INTC_LINE_VBLANK_END);
-	generateIntHandler(assembler, CINTC::INTC_LINE_VIF1);
-	generateIntHandler(assembler, CINTC::INTC_LINE_IPU);
-	generateIntHandler(assembler, CINTC::INTC_LINE_TIMER0);
-	generateIntHandler(assembler, CINTC::INTC_LINE_TIMER1);
-	generateIntHandler(assembler, CINTC::INTC_LINE_TIMER2);
-	generateIntHandler(assembler, CINTC::INTC_LINE_TIMER3);
+	assembler.MarkLabel(processDmacLabel);
 
-	assembler.JAL(BIOS_ADDRESS_ALARMHANDLER);
-	assembler.NOP();
+	//Process DMAC interrupt
+	{
+		assembler.JAL(BIOS_ADDRESS_DMACHANDLER);
+		assembler.NOP();
+	}
+
+	assembler.MarkLabel(doneLabel);
 
 	//Make sure interrupts are enabled (This is needed by some games that play
 	//with the status register in interrupt handlers and is done by the EE BIOS)
@@ -815,11 +830,6 @@ void CPS2OS::AssembleDmacHandler()
 	assembler.SD(CMIPS::S1, 0x0010, CMIPS::SP);
 	assembler.SD(CMIPS::S2, 0x0018, CMIPS::SP);
 
-	//Clear INTC cause
-	assembler.LI(CMIPS::T1, CINTC::INTC_STAT);
-	assembler.ADDIU(CMIPS::T0, CMIPS::R0, (1 << CINTC::INTC_LINE_DMAC));
-	assembler.SW(CMIPS::T0, 0x0000, CMIPS::T1);
-
 	//Load the DMA interrupt status
 	assembler.LI(CMIPS::T0, CDMAC::D_STAT);
 	assembler.LW(CMIPS::T0, 0x0000, CMIPS::T0);
@@ -828,7 +838,7 @@ void CPS2OS::AssembleDmacHandler()
 	assembler.AND(interruptStatusRegister, CMIPS::T0, CMIPS::T1);
 
 	//Initialize channel counter
-	assembler.ADDIU(channelCounterRegister, CMIPS::R0, 0x0009);
+	assembler.ADDIU(channelCounterRegister, CMIPS::R0, 0x000E);
 
 	assembler.MarkLabel(testChannelLabel);
 
@@ -998,17 +1008,24 @@ void CPS2OS::AssembleAlarmHandler()
 
 	//Prologue
 	//S0 -> Handler Counter
+	//S1 -> Compare Value
+	int32 stackAlloc = 0x20;
 
-	assembler.ADDIU(CMIPS::SP, CMIPS::SP, 0xFFF0);
+	assembler.ADDIU(CMIPS::SP, CMIPS::SP, -stackAlloc);
 	assembler.SD(CMIPS::RA, 0x0000, CMIPS::SP);
 	assembler.SD(CMIPS::S0, 0x0008, CMIPS::SP);
+	assembler.SD(CMIPS::S1, 0x0010, CMIPS::SP);
+
+	//Load T3 compare
+	assembler.LI(CMIPS::S1, CTimer::T3_COMP);
+	assembler.LW(CMIPS::S1, 0, CMIPS::S1);
 
 	//Initialize handler loop
 	assembler.ADDU(CMIPS::S0, CMIPS::R0, CMIPS::R0);
 
 	assembler.MarkLabel(checkHandlerLabel);
 
-	//Get the address to the current INTCHANDLER structure
+	//Get the address to the current ALARM structure
 	assembler.ADDIU(CMIPS::T0, CMIPS::R0, sizeof(ALARM));
 	assembler.MULTU(CMIPS::T0, CMIPS::S0, CMIPS::T0);
 	assembler.LI(CMIPS::T1, BIOS_ADDRESS_ALARM_BASE);
@@ -1017,6 +1034,13 @@ void CPS2OS::AssembleAlarmHandler()
 	//Check validity
 	assembler.LW(CMIPS::T1, offsetof(ALARM, isValid), CMIPS::T0);
 	assembler.BEQ(CMIPS::T1, CMIPS::R0, moveToNextHandler);
+	assembler.NOP();
+
+	assembler.LW(CMIPS::T1, offsetof(ALARM, compare), CMIPS::T0);
+	assembler.ORI(CMIPS::T2, CMIPS::R0, 0xFFFF);
+	assembler.AND(CMIPS::T1, CMIPS::T1, CMIPS::T2);
+
+	assembler.BNE(CMIPS::T1, CMIPS::S1, moveToNextHandler);
 	assembler.NOP();
 
 	//Load the necessary stuff
@@ -1046,7 +1070,9 @@ void CPS2OS::AssembleAlarmHandler()
 	//Epilogue
 	assembler.LD(CMIPS::RA, 0x0000, CMIPS::SP);
 	assembler.LD(CMIPS::S0, 0x0008, CMIPS::SP);
-	assembler.ADDIU(CMIPS::SP, CMIPS::SP, 0x10);
+	assembler.LD(CMIPS::S1, 0x0010, CMIPS::SP);
+	assembler.ADDIU(CMIPS::SP, CMIPS::SP, stackAlloc);
+
 	assembler.JR(CMIPS::RA);
 	assembler.NOP();
 }
@@ -1134,6 +1160,7 @@ void CPS2OS::ThreadSwitchContext(uint32 id)
 	}
 
 	m_currentThreadId = id;
+	m_idleEvaluator.NotifyEvent(Ee::CIdleEvaluator::EVENT_CHANGETHREAD, id);
 
 	//Load the new context
 	{
@@ -1266,52 +1293,127 @@ void CPS2OS::CheckLivingThreads()
 	}
 }
 
-bool CPS2OS::SemaReleaseSingleThread(uint32 semaId, bool cancelled)
+void CPS2OS::SemaLinkThread(uint32 semaId, uint32 threadId)
+{
+	auto thread = m_threads[threadId];
+	auto sema = m_semaphores[semaId];
+
+	assert(sema);
+
+	assert(thread);
+	assert(thread->semaWait == 0);
+	assert(thread->nextId == 0);
+
+	uint32* waitNextId = &sema->waitNextId;
+	while((*waitNextId) != 0)
+	{
+		auto waitThread = m_threads[*waitNextId];
+		waitNextId = &waitThread->nextId;
+	}
+
+	(*waitNextId) = threadId;
+	thread->semaWait = semaId;
+
+	sema->waitCount++;
+}
+
+void CPS2OS::SemaUnlinkThread(uint32 semaId, uint32 threadId)
+{
+	auto thread = m_threads[threadId];
+	auto sema = m_semaphores[semaId];
+
+	assert(sema);
+	assert(sema->waitCount != 0);
+	assert(sema->waitNextId != 0);
+
+	assert(thread);
+	assert(thread->semaWait == semaId);
+
+	uint32* waitNextId = &sema->waitNextId;
+	while((*waitNextId) != 0)
+	{
+		if((*waitNextId) == threadId)
+		{
+			break;
+		}
+		auto waitThread = m_threads[*waitNextId];
+		waitNextId = &waitThread->nextId;
+	}
+
+	assert((*waitNextId) != 0);
+	(*waitNextId) = thread->nextId;
+	thread->nextId = 0;
+	thread->semaWait = 0;
+
+	sema->waitCount--;
+}
+
+void CPS2OS::SemaReleaseSingleThread(uint32 semaId, bool cancelled)
 {
 	//Releases a single thread from a semaphore's queue
-	//TODO: Implement an actual queue
 
 	auto sema = m_semaphores[semaId];
 	assert(sema);
 	assert(sema->waitCount != 0);
+	assert(sema->waitNextId != 0);
 
-	uint32 returnValue = cancelled ? -1 : semaId;
-	bool changed = false;
-	for(auto threadIterator = std::begin(m_threads); threadIterator != std::end(m_threads); threadIterator++)
+	uint32 threadId = sema->waitNextId;
+
+	auto thread = m_threads[threadId];
+	assert(thread);
+	assert(thread->semaWait == semaId);
+
+	//Unlink thread
+	sema->waitNextId = thread->nextId;
+	thread->nextId = 0;
+	thread->semaWait = 0;
+
+	switch(thread->status)
 	{
-		auto thread = *threadIterator;
-		if(!thread) continue;
-		if((thread->status != THREAD_WAITING) && (thread->status != THREAD_SUSPENDED_WAITING)) continue;
-		if(thread->semaWait != semaId) continue;
-
-		switch(thread->status)
-		{
-		case THREAD_WAITING:
-			thread->status = THREAD_RUNNING;
-			LinkThread(threadIterator);
-			break;
-		case THREAD_SUSPENDED_WAITING:
-			thread->status = THREAD_SUSPENDED;
-			break;
-		default:
-			assert(0);
-			break;
-		}
-
-		auto context = reinterpret_cast<THREADCONTEXT*>(GetStructPtr(thread->contextPtr));
-		context->gpr[SC_RETURN].nD0 = static_cast<int32>(returnValue);
-
-		sema->waitCount--;
-		changed = true;
+	case THREAD_WAITING:
+		thread->status = THREAD_RUNNING;
+		LinkThread(threadId);
+		break;
+	case THREAD_SUSPENDED_WAITING:
+		thread->status = THREAD_SUSPENDED;
+		break;
+	default:
+		//Invalid thread state
+		assert(0);
 		break;
 	}
 
-	//Something went wrong if nothing changed
-	if(!changed)
+	uint32 returnValue = cancelled ? -1 : semaId;
+	auto context = reinterpret_cast<THREADCONTEXT*>(GetStructPtr(thread->contextPtr));
+	context->gpr[SC_RETURN].nD0 = static_cast<int32>(returnValue);
+
+	sema->waitCount--;
+}
+
+void CPS2OS::AlarmUpdateCompare()
+{
+	uint32 minCompare = UINT32_MAX;
+	for(const auto& alarm : m_alarms)
 	{
-		CLog::GetInstance().Warn(LOG_NAME, "SemaReleaseSingleThread: Had to release a single thread but it was not possible. Something could be in a wrong state.\r\n");
+		if(!alarm) continue;
+		minCompare = std::min<uint32>(alarm->compare, minCompare);
 	}
-	return changed;
+
+	if(minCompare == UINT32_MAX)
+	{
+		//No alarm to watch
+		return;
+	}
+
+	//Enable TIMER3 INTs
+	m_ee.m_pMemoryMap->SetWord(CTimer::T3_MODE, CTimer::MODE_CLOCK_SELECT_EXTERNAL | CTimer::MODE_COUNT_ENABLE | CTimer::MODE_EQUAL_FLAG | CTimer::MODE_EQUAL_INT_ENABLE);
+	m_ee.m_pMemoryMap->SetWord(CTimer::T3_COMP, minCompare & 0xFFFF);
+
+	uint32 mask = (1 << CINTC::INTC_LINE_TIMER3);
+	if(!(m_ee.m_pMemoryMap->GetWord(CINTC::INTC_MASK) & mask))
+	{
+		m_ee.m_pMemoryMap->SetWord(CINTC::INTC_MASK, mask);
+	}
 }
 
 void CPS2OS::CreateIdleThread()
@@ -1372,7 +1474,12 @@ CPS2OS::DECI2HANDLER* CPS2OS::GetDeci2Handler(uint32 id)
 	return &((DECI2HANDLER*)&m_ram[0x00008000])[id];
 }
 
-void CPS2OS::HandleInterrupt()
+Ee::CLibMc2& CPS2OS::GetLibMc2()
+{
+	return m_libMc2;
+}
+
+void CPS2OS::HandleInterrupt(int32 cpuIntLine)
 {
 	//Check if interrupts are enabled here because EIE bit isn't checked by CMIPS
 	if((m_ee.m_State.nCOP0[CCOP_SCU::STATUS] & INTERRUPTS_ENABLED_MASK) != INTERRUPTS_ENABLED_MASK)
@@ -1389,6 +1496,27 @@ void CPS2OS::HandleInterrupt()
 	{
 		auto thread = m_threads[m_currentThreadId];
 		ThreadSaveContext(thread, true);
+
+		m_idleEvaluator.NotifyEvent(Ee::CIdleEvaluator::EVENT_INTERRUPT, 0);
+	}
+
+	//Update CAUSE register
+	m_ee.m_State.nCOP0[CCOP_SCU::CAUSE] &= ~(CCOP_SCU::CAUSE_EXCCODE_MASK | CCOP_SCU::CAUSE_IP_2 | CCOP_SCU::CAUSE_IP_3);
+	m_ee.m_State.nCOP0[CCOP_SCU::CAUSE] |= CCOP_SCU::CAUSE_EXCCODE_INT;
+
+	switch(cpuIntLine)
+	{
+	case 0:
+		//INTC interrupt
+		m_ee.m_State.nCOP0[CCOP_SCU::CAUSE] |= CCOP_SCU::CAUSE_IP_2;
+		break;
+	case 1:
+		//DMAC interrupt
+		m_ee.m_State.nCOP0[CCOP_SCU::CAUSE] |= CCOP_SCU::CAUSE_IP_3;
+		break;
+	default:
+		assert(false);
+		break;
 	}
 
 	bool interrupted = m_ee.GenerateInterrupt(BIOS_ADDRESS_INTERRUPTHANDLER);
@@ -1420,6 +1548,36 @@ bool CPS2OS::CheckVBlankFlag()
 
 	SetVsyncFlagPtrs(0, 0);
 	return changed;
+}
+
+uint32 CPS2OS::SuspendCurrentThread()
+{
+	//For HLE module usage
+
+	uint32 threadId = m_currentThreadId;
+
+	auto thread = m_threads[threadId];
+	assert(thread);
+	assert(thread->status == THREAD_RUNNING);
+
+	thread->status = THREAD_SUSPENDED;
+	UnlinkThread(threadId);
+
+	ThreadShakeAndBake();
+
+	return threadId;
+}
+
+void CPS2OS::ResumeThread(uint32 threadId)
+{
+	//For HLE module usage
+
+	auto thread = m_threads[threadId];
+	assert(thread);
+	assert(thread->status == THREAD_SUSPENDED);
+
+	thread->status = THREAD_RUNNING;
+	LinkThread(threadId);
 }
 
 void CPS2OS::UpdateTLBEnabledState()
@@ -1675,15 +1833,33 @@ void CPS2OS::sc_SetVTLBRefillHandler()
 	case CCOP_SCU::CAUSE_EXCCODE_TLBS:
 		m_tlbsExceptionHandler = handler;
 		break;
+	default:
+		CLog::GetInstance().Warn(LOG_NAME, "Setting handler 0x%08X for unknown exception %d.\r\n", handler, cause);
+		break;
 	}
 
 	UpdateTLBEnabledState();
+
+	m_ee.m_State.nGPR[SC_RETURN].nD0 = static_cast<int32>(handler);
 }
 
 //0E
 void CPS2OS::sc_SetVCommonHandler()
 {
-	//TODO: Enable TLB processing
+	uint32 cause = m_ee.m_State.nGPR[SC_PARAM0].nV0;
+	uint32 handler = m_ee.m_State.nGPR[SC_PARAM1].nV0;
+
+	switch(cause << 2)
+	{
+	case CCOP_SCU::CAUSE_EXCCODE_TRAP:
+		m_trapExceptionHandler = handler;
+		break;
+	default:
+		CLog::GetInstance().Warn(LOG_NAME, "Setting handler 0x%08X for unknown exception %d.\r\n", handler, cause);
+		break;
+	}
+
+	m_ee.m_State.nGPR[SC_RETURN].nD0 = static_cast<int32>(handler);
 }
 
 //10
@@ -1856,20 +2032,15 @@ void CPS2OS::sc_EnableDmac()
 {
 	uint32 channel = m_ee.m_State.nGPR[SC_PARAM0].nV[0];
 	uint32 registerId = 0x10000 << channel;
+	bool changed = false;
 
 	if(!(m_ee.m_pMemoryMap->GetWord(CDMAC::D_STAT) & registerId))
 	{
 		m_ee.m_pMemoryMap->SetWord(CDMAC::D_STAT, registerId);
+		changed = true;
 	}
 
-	//Enable INT1
-	if(!(m_ee.m_pMemoryMap->GetWord(CINTC::INTC_MASK) & 0x02))
-	{
-		m_ee.m_pMemoryMap->SetWord(CINTC::INTC_MASK, 0x02);
-	}
-
-	m_ee.m_State.nGPR[SC_RETURN].nV[0] = 1;
-	m_ee.m_State.nGPR[SC_RETURN].nV[1] = 0;
+	m_ee.m_State.nGPR[SC_RETURN].nD0 = changed ? 1 : 0;
 }
 
 //17
@@ -1878,16 +2049,15 @@ void CPS2OS::sc_DisableDmac()
 {
 	uint32 channel = m_ee.m_State.nGPR[SC_PARAM0].nV[0];
 	uint32 registerId = 0x10000 << channel;
+	bool changed = false;
 
 	if(m_ee.m_pMemoryMap->GetWord(CDMAC::D_STAT) & registerId)
 	{
 		m_ee.m_pMemoryMap->SetWord(CDMAC::D_STAT, registerId);
-		m_ee.m_State.nGPR[SC_RETURN].nD0 = 1;
+		changed = true;
 	}
-	else
-	{
-		m_ee.m_State.nGPR[SC_RETURN].nD0 = 0;
-	}
+
+	m_ee.m_State.nGPR[SC_RETURN].nD0 = changed ? 1 : 0;
 }
 
 //18/1E
@@ -1905,11 +2075,19 @@ void CPS2OS::sc_SetAlarm()
 		return;
 	}
 
+	//Check limits (0 delay will probably be problematic and delay is a short)
+	assert((delay > 0) && (delay < 0x10000));
+
+	uint32 currentCount = m_ee.m_pMemoryMap->GetWord(CTimer::T3_COUNT);
+
 	auto alarm = m_alarms[alarmId];
 	alarm->delay = delay;
+	alarm->compare = currentCount + delay;
 	alarm->callback = callback;
 	alarm->callbackParam = callbackParam;
 	alarm->gp = m_ee.m_State.nGPR[CMIPS::GP].nV0;
+
+	AlarmUpdateCompare();
 
 	m_ee.m_State.nGPR[SC_RETURN].nD0 = alarmId;
 }
@@ -1927,6 +2105,8 @@ void CPS2OS::sc_ReleaseAlarm()
 	}
 
 	m_alarms.Free(alarmId);
+
+	AlarmUpdateCompare();
 }
 
 //20
@@ -2079,8 +2259,26 @@ void CPS2OS::sc_TerminateThread()
 		return;
 	}
 
+	switch(thread->status)
+	{
+	case THREAD_RUNNING:
+		UnlinkThread(id);
+		break;
+	case THREAD_WAITING:
+	case THREAD_SUSPENDED_WAITING:
+		SemaUnlinkThread(thread->semaWait, id);
+		break;
+	default:
+		assert(0);
+		[[fallthrough]];
+	case THREAD_SLEEPING:
+	case THREAD_SUSPENDED:
+	case THREAD_SUSPENDED_SLEEPING:
+		//Nothing to do
+		break;
+	}
+
 	thread->status = THREAD_ZOMBIE;
-	UnlinkThread(id);
 	ThreadReset(id);
 
 	m_ee.m_State.nGPR[SC_RETURN].nD0 = static_cast<int32>(id);
@@ -2124,6 +2322,8 @@ void CPS2OS::sc_RotateThreadReadyQueue()
 {
 	uint32 prio = m_ee.m_State.nGPR[SC_PARAM0].nV[0];
 
+	uint32 threadIdBefore = m_currentThreadId;
+
 	//Find first of this priority and reinsert if it's the same as the current thread
 	//If it's not the same, the schedule will be rotated when another thread is choosen
 	for(auto threadSchedulePair : m_threadSchedule)
@@ -2140,6 +2340,8 @@ void CPS2OS::sc_RotateThreadReadyQueue()
 	m_ee.m_State.nGPR[SC_RETURN].nD0 = static_cast<int32>(prio);
 
 	ThreadShakeAndBake();
+
+	m_idleEvaluator.NotifyEvent(Ee::CIdleEvaluator::EVENT_ROTATETHREADREADYQUEUE, threadIdBefore, m_currentThreadId);
 }
 
 //2D/2E
@@ -2543,7 +2745,9 @@ void CPS2OS::sc_SetupThread()
 	LinkThread(threadId);
 	m_currentThreadId = threadId;
 
-	m_ee.m_State.nGPR[SC_RETURN].nV[0] = stackAddr;
+	uint32 stackPtr = stackAddr - STACKRES;
+
+	m_ee.m_State.nGPR[SC_RETURN].nV[0] = stackPtr;
 	m_ee.m_State.nGPR[SC_RETURN].nV[1] = 0;
 }
 
@@ -2594,6 +2798,7 @@ void CPS2OS::sc_CreateSema()
 	sema->maxCount = semaParam->maxCount;
 	sema->option = semaParam->option;
 	sema->waitCount = 0;
+	sema->waitNextId = 0;
 
 	assert(sema->count <= sema->maxCount);
 
@@ -2620,8 +2825,7 @@ void CPS2OS::sc_DeleteSema()
 	{
 		while(sema->waitCount != 0)
 		{
-			bool succeeded = SemaReleaseSingleThread(id, true);
-			if(!succeeded) break;
+			SemaReleaseSingleThread(id, true);
 		}
 		ThreadShakeAndBake();
 	}
@@ -2643,6 +2847,8 @@ void CPS2OS::sc_SignalSema()
 		m_ee.m_State.nGPR[SC_RETURN].nD0 = static_cast<int32>(-1);
 		return;
 	}
+
+	m_idleEvaluator.NotifyEvent(Ee::CIdleEvaluator::EVENT_SIGNALSEMA, id);
 
 	//TODO: Check maximum value
 
@@ -2676,17 +2882,17 @@ void CPS2OS::sc_WaitSema()
 		return;
 	}
 
+	m_idleEvaluator.NotifyEvent(Ee::CIdleEvaluator::EVENT_WAITSEMA, id);
+
 	if(sema->count == 0)
 	{
 		//Put this thread in sleep mode and reschedule...
-		sema->waitCount++;
-
 		auto thread = m_threads[m_currentThreadId];
 		assert(thread->status == THREAD_RUNNING);
 		thread->status = THREAD_WAITING;
-		thread->semaWait = id;
 
 		UnlinkThread(m_currentThreadId);
+		SemaLinkThread(id, m_currentThreadId);
 		ThreadShakeAndBake();
 
 		return;
@@ -2890,6 +3096,9 @@ void CPS2OS::sc_SifSetDma()
 
 	auto xfers = reinterpret_cast<const SIFDMAREG*>(GetStructPtr(m_ee.m_State.nGPR[SC_PARAM0].nV0));
 	uint32 count = m_ee.m_State.nGPR[SC_PARAM1].nV[0];
+
+	//SifSetDma seems to always send something
+	if(count == 0) count = 1;
 
 	//DMA might call an interrupt handler, set return value now
 	uint32 queueId = queueIdx + BIOS_ID_BASE;

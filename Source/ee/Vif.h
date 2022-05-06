@@ -61,6 +61,7 @@ public:
 	virtual void Reset();
 	uint32 GetRegister(uint32);
 	void SetRegister(uint32, uint32);
+	void CountTicks(uint32);
 	virtual void SaveState(Framework::CZipArchiveWriter&);
 	virtual void LoadState(Framework::CZipArchiveReader&);
 
@@ -75,6 +76,10 @@ protected:
 	enum
 	{
 		CODE_CMD_MARK = 0x07,
+		CODE_CMD_FLUSHE = 0x10,
+		CODE_CMD_STMASK = 0x20,
+		CODE_CMD_STROW = 0x30,
+		CODE_CMD_STCOL = 0x31,
 	};
 
 	enum
@@ -87,6 +92,12 @@ protected:
 
 	enum
 	{
+		STAT_VPS_IDLE = 0x00,
+		STAT_VPS_WAITING = 0x01,
+		STAT_VPS_DECODING = 0x02,
+		STAT_VPS_TRANSFER = 0x03,
+		STAT_VPS_MASK = 0x03,
+
 		STAT_FDR = 0x00800000,
 	};
 
@@ -567,6 +578,7 @@ protected:
 	uint32 m_writeTick;
 	uint32 m_pendingMicroProgram;
 	uint32 m_incomingFifoDelay;
+	int32 m_interruptDelayTicks;
 
 	CProfiler::ZoneHandle m_vifProfilerZone = 0;
 };

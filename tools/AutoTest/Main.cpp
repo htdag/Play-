@@ -121,7 +121,6 @@ void ExecuteEeTest(const fs::path& testFilePath, const std::string& gsHandlerNam
 	//Setup virtual machine
 	CPS2VM virtualMachine;
 	virtualMachine.Initialize();
-	virtualMachine.Reset();
 	virtualMachine.CreateGSHandler(GetGsHandlerFactoryFunction(gsHandlerName));
 	auto connection = virtualMachine.m_ee->m_os->OnRequestExit.Connect(
 	    [&executionOver]() {
@@ -164,7 +163,6 @@ void ExecuteIopTest(const fs::path& testFilePath)
 	//Setup virtual machine
 	CPS2VM virtualMachine;
 	virtualMachine.Initialize();
-	virtualMachine.Reset();
 	virtualMachine.CreateGSHandler(CGSH_Null::GetFactoryFunction());
 	{
 		auto iopOs = dynamic_cast<CIopBios*>(virtualMachine.m_iop->m_bios.get());
@@ -176,7 +174,7 @@ void ExecuteIopTest(const fs::path& testFilePath)
 				    executionOver = true;
 			    }
 		    });
-		iopOs->StartModule(rootModuleId, "", nullptr, 0);
+		iopOs->StartModule(CIopBios::MODULESTARTREQUEST_SOURCE::REMOTE, rootModuleId, "", nullptr, 0);
 		iopOs->GetIoman()->SetFileStream(Iop::CIoman::FID_STDOUT, resultStream);
 	}
 	virtualMachine.Resume();

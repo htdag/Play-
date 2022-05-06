@@ -15,7 +15,9 @@ namespace GSH_Vulkan
 		VkPhysicalDevice physicalDevice;
 		Framework::Vulkan::CDevice device;
 		VkSurfaceKHR surface = VK_NULL_HANDLE;
-		VkSurfaceFormatKHR surfaceFormat;
+		VkSurfaceFormatKHR surfaceFormat = {VK_FORMAT_UNDEFINED, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
+		uint32 storageBufferAlignment = 0;
+		uint32 computeWorkgroupInvocations = 0;
 		Framework::Vulkan::CCommandBufferPool commandBufferPool;
 		VkQueue queue = VK_NULL_HANDLE;
 		VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
@@ -37,6 +39,7 @@ namespace GSH_Vulkan
 			{
 			default:
 				assert(false);
+				[[fallthrough]];
 			case CGSHandler::PSMCT32:
 			case CGSHandler::PSMCT24:
 			case CGSHandler::PSMCT24_UNK:

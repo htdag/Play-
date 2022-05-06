@@ -1,6 +1,6 @@
 #include "GsStateUtils.h"
 #include "string_format.h"
-#include "gs/GSH_OpenGL/GSH_OpenGL.h"
+#include "gs/GsDebuggerInterface.h"
 
 // clang-format off
 static const char* g_yesNoString[2] =
@@ -217,16 +217,26 @@ std::string CGsStateUtils::GetInputState(CGSHandler* gs)
 {
 	std::string result;
 
-	auto prim = make_convertible<CGSHandler::PRIM>(gs->GetRegisters()[GS_REG_PRIM]);
-	auto xyOffset = make_convertible<CGSHandler::XYOFFSET>(gs->GetRegisters()[GS_REG_XYOFFSET_1 + prim.nContext]);
-
 	bool usePrmode = (gs->GetRegisters()[GS_REG_PRMODECONT] & 1) == 0;
+
+	auto prim = make_convertible<CGSHandler::PRMODE>(0);
+	if(usePrmode)
+	{
+		prim <<= gs->GetRegisters()[GS_REG_PRMODE];
+	}
+	else
+	{
+		prim <<= gs->GetRegisters()[GS_REG_PRIM];
+	}
+
+	auto primitiveType = gs->GetRegisters()[GS_REG_PRIM] & 0x07;
+	auto xyOffset = make_convertible<CGSHandler::XYOFFSET>(gs->GetRegisters()[GS_REG_XYOFFSET_1 + prim.nContext]);
 
 	result += string_format("Use PRMODE: %s\r\n", g_yesNoString[usePrmode]);
 
 	result += string_format("Primitive:\r\n");
 	result += string_format("\tContext: %d\r\n", prim.nContext + 1);
-	result += string_format("\tType: %s\r\n", g_primitiveTypeString[prim.nType]);
+	result += string_format("\tType: %s\r\n", g_primitiveTypeString[primitiveType]);
 	result += string_format("\tUse Gouraud: %s\r\n", g_yesNoString[prim.nShading]);
 	result += string_format("\tUse Texture: %s\r\n", g_yesNoString[prim.nTexture]);
 	result += string_format("\tUse Fog: %s\r\n", g_yesNoString[prim.nFog]);
@@ -237,16 +247,20 @@ std::string CGsStateUtils::GetInputState(CGSHandler* gs)
 
 	result += "\r\n";
 
-	auto vertices = static_cast<CGSH_OpenGL*>(gs)->GetInputVertices();
+	CGSHandler::VERTEX vertices[3] = {};
+	if(auto debuggerInterface = dynamic_cast<CGsDebuggerInterface*>(gs))
+	{
+		memcpy(&vertices, debuggerInterface->GetInputVertices(), sizeof(vertices));
+	}
 
 	result += string_format("Positions:\r\n");
 	result += string_format("\t                 PosX        PosY        PosZ        OfsX        OfsY\r\n");
 	for(unsigned int i = 0; i < 3; i++)
 	{
 		auto vertex = vertices[i];
-		float posX = static_cast<float>((vertex.nPosition >> 0) & 0xFFFF) / 16;
-		float posY = static_cast<float>((vertex.nPosition >> 16) & 0xFFFF) / 16;
-		uint32 posZ = static_cast<uint32>(vertex.nPosition >> 32);
+		float posX = static_cast<float>((vertex.position >> 0) & 0xFFFF) / 16;
+		float posY = static_cast<float>((vertex.position >> 16) & 0xFFFF) / 16;
+		uint32 posZ = static_cast<uint32>(vertex.position >> 32);
 		result += string_format("\tVertex %i:  %+10.4f  %+10.4f  0x%08X  %+10.4f  %+10.4f\r\n",
 		                        i, posX, posY, posZ, posX - xyOffset.GetX(), posY - xyOffset.GetY());
 	}
@@ -258,9 +272,9 @@ std::string CGsStateUtils::GetInputState(CGSHandler* gs)
 	for(unsigned int i = 0; i < 3; i++)
 	{
 		auto vertex = vertices[i];
-		auto st = make_convertible<CGSHandler::ST>(vertex.nST);
-		auto rgbaq = make_convertible<CGSHandler::RGBAQ>(vertex.nRGBAQ);
-		auto uv = make_convertible<CGSHandler::UV>(vertex.nUV);
+		auto st = make_convertible<CGSHandler::ST>(vertex.st);
+		auto rgbaq = make_convertible<CGSHandler::RGBAQ>(vertex.rgbaq);
+		auto uv = make_convertible<CGSHandler::UV>(vertex.uv);
 		result += string_format("\tVertex %i:  %+10.4f  %+10.4f  %+10.4f  %+10.4f  %+10.4f\r\n",
 		                        i, st.nS, st.nT, rgbaq.nQ, uv.GetU(), uv.GetV());
 	}
@@ -270,7 +284,7 @@ std::string CGsStateUtils::GetInputState(CGSHandler* gs)
 	for(unsigned int i = 0; i < 3; i++)
 	{
 		auto vertex = vertices[i];
-		auto rgbaq = make_convertible<CGSHandler::RGBAQ>(vertex.nRGBAQ);
+		auto rgbaq = make_convertible<CGSHandler::RGBAQ>(vertex.rgbaq);
 		result += string_format("\tVertex %i:        0x%02X        0x%02X        0x%02X        0x%02X\r\n",
 		                        i, rgbaq.nR, rgbaq.nG, rgbaq.nB, rgbaq.nA);
 	}
@@ -281,7 +295,7 @@ std::string CGsStateUtils::GetInputState(CGSHandler* gs)
 	{
 		auto vertex = vertices[i];
 		result += string_format("\tVertex %i:        0x%02X\r\n",
-		                        i, vertex.nFog);
+		                        i, vertex.fog);
 	}
 
 	result += "\r\n";
@@ -398,6 +412,13 @@ std::string CGsStateUtils::GetContextState(CGSHandler* gs, unsigned int contextI
 		                        g_alphaBlendAbdCoefString[alpha.nA], g_alphaBlendAbdCoefString[alpha.nB],
 		                        g_alphaBlendCCoefString[alpha.nC], g_alphaBlendAbdCoefString[alpha.nD]);
 		result += string_format("\tFixed Value: 0x%02X\r\n", alpha.nFix);
+	}
+
+	{
+		auto scissor = make_convertible<CGSHandler::SCISSOR>(gs->GetRegisters()[GS_REG_SCISSOR_1 + contextId]);
+		result += string_format("Scissor:\r\n");
+		result += string_format("\tTop: %d, %d\r\n", scissor.scax0, scissor.scay0);
+		result += string_format("\tBottom: %d, %d\r\n", scissor.scax1, scissor.scay1);
 	}
 
 	result += "\r\n";

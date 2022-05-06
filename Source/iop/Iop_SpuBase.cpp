@@ -2,6 +2,7 @@
 #include <cstring>
 #include <cmath>
 #include <climits>
+#include <algorithm>
 #include "string_format.h"
 #include "../Log.h"
 #include "../states/RegisterStateFile.h"
@@ -592,16 +593,36 @@ int32 CSpuBase::ComputeChannelVolume(const CHANNEL_VOLUME& volume, int32 current
 	else
 	{
 		assert(volume.sweep.phase == 0);
-		assert(volume.sweep.slope == 0);
-		if(volume.sweep.decrease)
+		if(volume.sweep.slope == 0)
 		{
-			uint32 sweepDelta = g_linearDecreaseSweepDeltas[volume.sweep.volume];
-			volumeLevel = currentVolume - sweepDelta;
+			//Linear increase/decrease
+			if(volume.sweep.decrease)
+			{
+				uint32 sweepDelta = g_linearDecreaseSweepDeltas[volume.sweep.volume];
+				volumeLevel = currentVolume - sweepDelta;
+			}
+			else
+			{
+				uint32 sweepDelta = g_linearIncreaseSweepDeltas[volume.sweep.volume];
+				volumeLevel = currentVolume + sweepDelta;
+			}
 		}
 		else
 		{
-			uint32 sweepDelta = g_linearIncreaseSweepDeltas[volume.sweep.volume];
-			volumeLevel = currentVolume + sweepDelta;
+			//Exponential increase/decrease
+			if(volume.sweep.decrease)
+			{
+				int64 sweepDelta = static_cast<int64>(currentVolume) * static_cast<int64>(volume.sweep.volume) / 0x7F;
+				assert(sweepDelta >= 0);
+				int32 baseVolume = std::max(1, currentVolume);
+				uint32 sweepDeltaClamped = std::clamp<int64>(sweepDelta, 1, baseVolume);
+				volumeLevel = baseVolume - sweepDeltaClamped;
+			}
+			else
+			{
+				//Not supported
+				assert(false);
+			}
 		}
 		volumeLevel = std::max<int32>(volumeLevel, 0x00000000);
 		volumeLevel = std::min<int32>(volumeLevel, 0x7FFFFFFF);
@@ -635,7 +656,8 @@ void CSpuBase::Render(int16* samples, unsigned int sampleCount, unsigned int sam
 		for(unsigned int i = 0; i < 24; i++)
 		{
 			auto& channel(m_channel[i]);
-			if((channel.status == STOPPED) && !checkIrqs) continue;
+			bool hasDynamicVolume = (channel.volumeLeft.mode.mode != 0) || (channel.volumeRight.mode.mode != 0);
+			if((channel.status == STOPPED) && !checkIrqs && !hasDynamicVolume) continue;
 			auto& reader(m_reader[i]);
 			reader.SetIrqAddress(m_irqAddr);
 			if(channel.status == KEY_ON)

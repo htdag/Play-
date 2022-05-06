@@ -1,6 +1,7 @@
 #include <cstring>
 #include "../Log.h"
 #include "../states/RegisterStateFile.h"
+#include "../Ps2Const.h"
 #include "IopBios.h"
 #include "Iop_Cdvdman.h"
 
@@ -9,6 +10,7 @@
 #define STATE_FILENAME ("iop_cdvdman/state.xml")
 #define STATE_CALLBACK_ADDRESS ("CallbackAddress")
 #define STATE_STATUS ("Status")
+#define STATE_DISCCHANGED ("DiscChanged")
 #define STATE_PENDING_COMMAND ("PendingCommand")
 
 #define FUNCTION_CDINIT "CdInit"
@@ -21,6 +23,7 @@
 #define FUNCTION_CDGETDISKTYPE "CdGetDiskType"
 #define FUNCTION_CDDISKREADY "CdDiskReady"
 #define FUNCTION_CDTRAYREQ "CdTrayReq"
+#define FUNCTION_CDREADILINKID "CdReadILinkId"
 #define FUNCTION_CDREADCLOCK "CdReadClock"
 #define FUNCTION_CDSTATUS "CdStatus"
 #define FUNCTION_CDCALLBACK "CdCallback"
@@ -31,6 +34,7 @@
 #define FUNCTION_CDSTSTART "CdStStart"
 #define FUNCTION_CDSTSTAT "CdStStat"
 #define FUNCTION_CDSTSTOP "CdStStop"
+#define FUNCTION_CDREADMODEL "CdReadModel"
 #define FUNCTION_CDSETMMODE "CdSetMmode"
 #define FUNCTION_CDSTSEEKF "CdStSeekF"
 #define FUNCTION_CDREADDVDDUALINFO "CdReadDvdDualInfo"
@@ -49,6 +53,7 @@ void CCdvdman::LoadState(Framework::CZipArchiveReader& archive)
 	CRegisterStateFile registerFile(*archive.BeginReadFile(STATE_FILENAME));
 	m_callbackPtr = registerFile.GetRegister32(STATE_CALLBACK_ADDRESS);
 	m_status = registerFile.GetRegister32(STATE_STATUS);
+	m_discChanged = registerFile.GetRegister32(STATE_DISCCHANGED);
 	m_pendingCommand = static_cast<COMMAND>(registerFile.GetRegister32(STATE_PENDING_COMMAND));
 }
 
@@ -57,6 +62,7 @@ void CCdvdman::SaveState(Framework::CZipArchiveWriter& archive) const
 	auto registerFile = new CRegisterStateFile(STATE_FILENAME);
 	registerFile->SetRegister32(STATE_CALLBACK_ADDRESS, m_callbackPtr);
 	registerFile->SetRegister32(STATE_STATUS, m_status);
+	registerFile->SetRegister32(STATE_DISCCHANGED, m_discChanged);
 	registerFile->SetRegister32(STATE_PENDING_COMMAND, m_pendingCommand);
 	archive.InsertFile(registerFile);
 }
@@ -211,6 +217,9 @@ std::string CCdvdman::GetFunctionName(unsigned int functionId) const
 	case 14:
 		return FUNCTION_CDTRAYREQ;
 		break;
+	case 22:
+		return FUNCTION_CDREADILINKID;
+		break;
 	case 24:
 		return FUNCTION_CDREADCLOCK;
 		break;
@@ -240,6 +249,9 @@ std::string CCdvdman::GetFunctionName(unsigned int functionId) const
 		break;
 	case 61:
 		return FUNCTION_CDSTSTOP;
+		break;
+	case 64:
+		return FUNCTION_CDREADMODEL;
 		break;
 	case 75:
 		return FUNCTION_CDSETMMODE;
@@ -302,6 +314,11 @@ void CCdvdman::Invoke(CMIPS& ctx, unsigned int functionId)
 		    ctx.m_State.nGPR[CMIPS::A0].nV0,
 		    ctx.m_State.nGPR[CMIPS::A1].nV0);
 		break;
+	case 22:
+		ctx.m_State.nGPR[CMIPS::V0].nV0 = CdReadILinkId(
+		    ctx.m_State.nGPR[CMIPS::A0].nV0,
+		    ctx.m_State.nGPR[CMIPS::A1].nV0);
+		break;
 	case 24:
 		ctx.m_State.nGPR[CMIPS::V0].nV0 = CdReadClock(ctx.m_State.nGPR[CMIPS::A0].nV0);
 		break;
@@ -341,6 +358,11 @@ void CCdvdman::Invoke(CMIPS& ctx, unsigned int functionId)
 		break;
 	case 61:
 		ctx.m_State.nGPR[CMIPS::V0].nV0 = CdStStop();
+		break;
+	case 64:
+		ctx.m_State.nGPR[CMIPS::V0].nV0 = CdReadModel(
+		    ctx.m_State.nGPR[CMIPS::A0].nV0,
+		    ctx.m_State.nGPR[CMIPS::A1].nV0);
 		break;
 	case 75:
 		ctx.m_State.nGPR[CMIPS::V0].nV0 = CdSetMmode(ctx.m_State.nGPR[CMIPS::A0].nV0);
@@ -438,7 +460,7 @@ uint32 CCdvdman::CdRead(uint32 startSector, uint32 sectorCount, uint32 bufferPtr
 	}
 	if(m_opticalMedia && (bufferPtr != 0))
 	{
-		uint8* buffer = &m_ram[bufferPtr];
+		uint8* buffer = &m_ram[bufferPtr & (PS2::IOP_RAM_SIZE - 1)];
 		static const uint32 sectorSize = 2048;
 		auto fileSystem = m_opticalMedia->GetFileSystem();
 		for(unsigned int i = 0; i < sectorCount; i++)
@@ -514,8 +536,32 @@ uint32 CCdvdman::CdTrayReq(uint32 mode, uint32 trayCntPtr)
 	                          mode, trayCntPtr);
 
 	auto trayCnt = reinterpret_cast<uint32*>(m_ram + trayCntPtr);
-	(*trayCnt) = 0;
 
+	if(mode == CDVD_TRAY_CHECK && m_discChanged)
+	{
+		(*trayCnt) = 1;
+		m_discChanged = false;
+	}
+	else
+	{
+		(*trayCnt) = 0;
+	}
+
+	return 1;
+}
+
+uint32 CCdvdman::CdReadILinkId(uint32 idPtr, uint32 statPtr)
+{
+	CLog::GetInstance().Print(LOG_NAME, FUNCTION_CDREADILINKID "(idPtr = 0x%08X, statPtr = 0x%08X);\r\n",
+	                          idPtr, statPtr);
+
+	auto idBuffer = m_ram + idPtr;
+	//iLink ID is 64-bits (8 bytes)
+	memset(idBuffer, 0xAA, 8);
+	if(statPtr != 0)
+	{
+		*reinterpret_cast<uint32*>(m_ram + statPtr) = 0;
+	}
 	return 1;
 }
 
@@ -604,6 +650,21 @@ uint32 CCdvdman::CdStStat()
 uint32 CCdvdman::CdStStop()
 {
 	CLog::GetInstance().Print(LOG_NAME, FUNCTION_CDSTSTOP "();\r\n");
+	return 1;
+}
+
+uint32 CCdvdman::CdReadModel(uint32 modelPtr, uint32 statPtr)
+{
+	CLog::GetInstance().Print(LOG_NAME, FUNCTION_CDREADMODEL "(modelPtr = 0x%08X, statPtr = 0x%08X);\r\n",
+	                          modelPtr, statPtr);
+
+	auto modelBuffer = reinterpret_cast<char*>(m_ram + modelPtr);
+	//modelBuffer seems to be 32 bytes long (Silent Scope 2 uses that number)
+	strcpy(modelBuffer, "SCPH-30000");
+	if(statPtr != 0)
+	{
+		*reinterpret_cast<uint32*>(m_ram + statPtr) = 0;
+	}
 	return 1;
 }
 

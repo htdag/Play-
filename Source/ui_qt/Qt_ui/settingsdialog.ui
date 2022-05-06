@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>612</width>
-    <height>380</height>
+    <width>625</width>
+    <height>439</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -196,6 +196,13 @@
         </widget>
        </item>
        <item>
+        <widget class="QCheckBox" name="checkBox_showEECPUUsage">
+         <property name="text">
+          <string>Show EE CPU Usage</string>
+         </property>
+        </widget>
+       </item>
+       <item>
         <spacer name="verticalSpacer_2">
          <property name="orientation">
           <enum>Qt::Vertical</enum>
@@ -285,6 +292,13 @@
         </widget>
        </item>
        <item>
+        <widget class="QCheckBox" name="checkBox_enable_gs_ram_reads">
+         <property name="text">
+          <string>Enable GS RAM reads</string>
+         </property>
+        </widget>
+       </item>
+       <item>
         <widget class="QCheckBox" name="checkBox_force_bilinear_filtering">
          <property name="text">
           <string>Force Bilinear Filtering</string>
@@ -368,54 +382,51 @@
       </layout>
      </widget>
      <widget class="QWidget" name="Audio">
-      <widget class="QCheckBox" name="checkBox_enable_audio">
-       <property name="geometry">
-        <rect>
-         <x>20</x>
-         <y>20</y>
-         <width>341</width>
-         <height>22</height>
-        </rect>
-       </property>
-       <property name="text">
-        <string>Enable Audio Output</string>
-       </property>
-      </widget>
-      <widget class="QSpinBox" name="spinBox_spuBlockCount">
-       <property name="geometry">
-        <rect>
-         <x>20</x>
-         <y>70</y>
-         <width>121</width>
-         <height>22</height>
-        </rect>
-       </property>
-       <property name="minimum">
-        <number>10</number>
-       </property>
-       <property name="maximum">
-        <number>400</number>
-       </property>
-       <property name="singleStep">
-        <number>10</number>
-       </property>
-       <property name="value">
-        <number>400</number>
-       </property>
-      </widget>
-      <widget class="QLabel" name="label_4">
-       <property name="geometry">
-        <rect>
-         <x>20</x>
-         <y>50</y>
-         <width>171</width>
-         <height>16</height>
-        </rect>
-       </property>
-       <property name="text">
-        <string>Buffer Size:</string>
-       </property>
-      </widget>
+      <layout class="QVBoxLayout" name="verticalLayout2">
+       <item>
+        <widget class="QCheckBox" name="checkBox_enable_audio">
+         <property name="text">
+          <string>Enable Audio Output</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="label_4">
+         <property name="text">
+          <string>Buffer Size:</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QSpinBox" name="spinBox_spuBlockCount">
+         <property name="minimum">
+          <number>10</number>
+         </property>
+         <property name="maximum">
+          <number>400</number>
+         </property>
+         <property name="singleStep">
+          <number>10</number>
+         </property>
+         <property name="value">
+          <number>400</number>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="verticalSpacer_3">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
      </widget>
     </widget>
    </item>

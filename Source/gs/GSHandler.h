@@ -20,6 +20,7 @@ class CGsPacketMetadata;
 class CINTC;
 
 #define PREF_CGSHANDLER_PRESENTATION_MODE "renderer.presentationmode"
+#define PREF_CGSHANDLER_GS_RAM_READS_ENABLED "renderer.ramreads.enabled"
 #define PREF_CGSHANDLER_WIDESCREEN "renderer.widescreen"
 
 enum GS_REGS
@@ -86,6 +87,12 @@ public:
 		RAMSIZE = 0x00400000,
 	};
 
+	enum CLUTSIZE
+	{
+		CLUTSIZE = 0x400,
+		CLUTENTRYCOUNT = (CLUTSIZE / 2)
+	};
+
 	enum PRESENTATION_MODE
 	{
 		PRESENTATION_MODE_FILL,
@@ -120,6 +127,15 @@ public:
 		CSR_FIFO_NEITHER = 0x0000,
 		CSR_FIFO_EMPTY = 0x4000,
 		CSR_FIFO_FULL = 0x8000
+	};
+
+	struct VERTEX
+	{
+		uint64 position;
+		uint64 rgbaq;
+		uint64 uv;
+		uint64 st;
+		uint8 fog;
 	};
 
 	struct PRESENTATION_PARAMS
@@ -776,7 +792,10 @@ public:
 	virtual void LoadState(Framework::CZipArchiveReader&);
 	void Copy(CGSHandler*);
 
-	void SetFrameDump(CFrameDump*);
+	void BeginFrameDump(CFrameDump*);
+	void EndFrameDump();
+
+	void InitFromFrameDump(CFrameDump*);
 
 	bool GetDrawEnabled() const;
 	void SetDrawEnabled(bool);
@@ -813,7 +832,6 @@ public:
 	virtual void ProcessClutTransfer(uint32, uint32) = 0;
 	void Flip(bool = false);
 	void Finish();
-	virtual void ReadFramebuffer(uint32, uint32, void*) = 0;
 
 	void MakeLinearCLUT(const TEX0&, std::array<uint32, 256>&) const;
 
@@ -834,6 +852,7 @@ public:
 	uint32 GetCrtHSyncFrequency() const;
 	bool GetCrtIsInterlaced() const;
 	bool GetCrtIsFrameMode() const;
+	std::pair<uint32, uint32> GetDisplayBounds(uint64) const;
 	std::pair<uint64, uint64> GetCurrentDisplayInfo();
 	unsigned int GetCurrentReadCircuit();
 
@@ -856,15 +875,9 @@ protected:
 		INTEGER64 value;
 	};
 
-	enum CLUTSIZE
-	{
-		CLUTSIZE = 0x400,
-		CLUTENTRYCOUNT = (CLUTSIZE / 2)
-	};
-
 	enum
 	{
-		REGISTERWRITEBUFFER_SIZE = 0x100000,
+		REGISTERWRITEBUFFER_SIZE = 0x140000,
 		REGISTERWRITEBUFFER_SUBMIT_THRESHOLD = 0x100
 	};
 
@@ -996,6 +1009,7 @@ protected:
 	template <typename Storage>
 	void TransferReadHandlerGeneric(void*, uint32);
 	void TransferReadHandlerPSMCT24(void*, uint32);
+	void TransferReadHandlerPSMT8H(void*, uint32);
 
 	virtual void SyncCLUT(const TEX0&);
 	bool ProcessCLD(const TEX0&);

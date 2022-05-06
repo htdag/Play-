@@ -28,11 +28,8 @@ public class EmulatorDrawerFragment extends Fragment
 		void onSaveStateSelected();
 
 		void onLoadStateSelected();
-	}
 
-	public EmulatorDrawerFragment()
-	{
-
+		void onSettingsSelected();
 	}
 
 	public void setEventListener(EventListener eventListener)
@@ -44,7 +41,7 @@ public class EmulatorDrawerFragment extends Fragment
 	public View onCreateView(LayoutInflater inflater, ViewGroup container, Bundle savedInstanceState)
 	{
 		LinearLayout layout = (LinearLayout)inflater.inflate(R.layout.fragment_emulator_drawer, container, false);
-		_listView = (ListView)layout.findViewById(R.id.fragment_emulator_drawer_list);
+		_listView = layout.findViewById(R.id.fragment_emulator_drawer_list);
 		return layout;
 	}
 
@@ -62,19 +59,13 @@ public class EmulatorDrawerFragment extends Fragment
 								{
 										getString(R.string.emulator_drawer_savestate),
 										getString(R.string.emulator_drawer_loadstate),
+										getString(R.string.main_menu_settings),
 										getString(R.string.emulator_drawer_exit),
 								}
 				)
 		);
-		_listView.setOnItemClickListener(
-				new AdapterView.OnItemClickListener()
-				{
-					@Override
-					public void onItemClick(AdapterView<?> parent, View view, int position, long id)
-					{
-						selectItem(position);
-					}
-				}
+		_listView.setOnItemClickListener((parent, view, position, id) ->
+				selectItem(position)
 		);
 	}
 
@@ -102,7 +93,7 @@ public class EmulatorDrawerFragment extends Fragment
 
 	public boolean isDrawerOpened()
 	{
-		return (_drawerLayout != null) && (_drawerLayout.isDrawerOpen(_fragmentView));
+		return _drawerLayout != null && _drawerLayout.isDrawerOpen(_fragmentView);
 	}
 
 	private void selectItem(int position)
@@ -117,6 +108,9 @@ public class EmulatorDrawerFragment extends Fragment
 			_eventListener.onLoadStateSelected();
 			break;
 		case 2:
+			_eventListener.onSettingsSelected();
+			break;
+		case 3:
 			_eventListener.onExitSelected();
 			break;
 		}

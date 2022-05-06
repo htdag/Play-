@@ -3,7 +3,14 @@
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include "android/AssetManager.h"
+#include "android/ContentResolver.h"
 #include "android/JavaVM.h"
+#include "android/android_database_Cursor.h"
+#include "android/android_net_Uri.h"
+#include "android/android_os_ParcelFileDescriptor.h"
+#include "android/java_security_MessageDigest.h"
+#include "android/javax_crypto_Mac.h"
+#include "android/javax_crypto_spec_SecretKeySpec.h"
 #include "PathUtils.h"
 #include "../AppConfig.h"
 #include "../DiskUtils.h"
@@ -13,6 +20,7 @@
 #include "../gs/GSH_Null.h"
 #include "NativeShared.h"
 #include "GSH_OpenGLAndroid.h"
+#include "GSH_VulkanAndroid.h"
 #include "SH_OpenSL.h"
 #include "ui_shared/StatsManager.h"
 #include "com_virtualapplications_play_Bootable.h"
@@ -24,8 +32,13 @@
 CPS2VM* g_virtualMachine = nullptr;
 CPS2VM::ProfileFrameDoneSignal::Connection g_ProfileFrameDoneConnection;
 Framework::CSignal<void(uint32)>::Connection g_OnNewFrameConnection;
+int g_currentGsHandlerId = -1;
 
+#define PREF_VIDEO_GS_HANDLER ("video.gshandler")
 #define PREF_AUDIO_ENABLEOUTPUT ("audio.enableoutput")
+
+#define PREFERENCE_VALUE_VIDEO_GS_HANDLER_OPENGL 0
+#define PREFERENCE_VALUE_VIDEO_GS_HANDLER_VULKAN 1
 
 static void SetupSoundHandler()
 {
@@ -47,6 +60,7 @@ static void ResetVirtualMachine()
 	g_virtualMachine->Pause();
 	g_virtualMachine->Reset();
 	g_virtualMachine->ReloadSpuBlockCount();
+	g_virtualMachine->ReloadFrameRateLimit();
 	SetupSoundHandler();
 }
 
@@ -57,6 +71,13 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* aReserved)
 	java::net::HttpURLConnection_ClassInfo::GetInstance().PrepareClassInfo();
 	java::io::InputStream_ClassInfo::GetInstance().PrepareClassInfo();
 	java::io::OutputStream_ClassInfo::GetInstance().PrepareClassInfo();
+	java::security::MessageDigest_ClassInfo::GetInstance().PrepareClassInfo();
+	javax::crypto::Mac_ClassInfo::GetInstance().PrepareClassInfo();
+	javax::crypto::spec::SecretKeySpec_ClassInfo::GetInstance().PrepareClassInfo();
+	android::content::ContentResolver_ClassInfo::GetInstance().PrepareClassInfo();
+	android::database::Cursor_ClassInfo::GetInstance().PrepareClassInfo();
+	android::net::Uri_ClassInfo::GetInstance().PrepareClassInfo();
+	android::os::ParcelFileDescriptor_ClassInfo::GetInstance().PrepareClassInfo();
 	com::virtualapplications::play::Bootable_ClassInfo::GetInstance().PrepareClassInfo();
 	return JNI_VERSION_1_6;
 }
@@ -68,11 +89,24 @@ extern "C" JNIEXPORT void JNICALL Java_com_virtualapplications_play_NativeIntero
 	env->ReleaseStringUTFChars(dirPathString, dirPath);
 }
 
+extern "C" JNIEXPORT void JNICALL Java_com_virtualapplications_play_NativeInterop_setCacheDirPath(JNIEnv* env, jobject obj, jstring dirPathString)
+{
+	auto dirPath = env->GetStringUTFChars(dirPathString, 0);
+	Framework::PathUtils::SetCacheDirPath(dirPath);
+	env->ReleaseStringUTFChars(dirPathString, dirPath);
+}
+
 extern "C" JNIEXPORT void JNICALL Java_com_virtualapplications_play_NativeInterop_setAssetManager(JNIEnv* env, jobject obj, jobject assetManagerJava)
 {
 	auto assetManager = AAssetManager_fromJava(env, assetManagerJava);
 	assert(assetManager != nullptr);
 	Framework::Android::CAssetManager::GetInstance().SetAssetManager(assetManager);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_virtualapplications_play_NativeInterop_setContentResolver(JNIEnv* env, jclass clazz, jobject contentResolverJava)
+{
+	auto contentResolver = Framework::CJavaObject::CastTo<android::content::ContentResolver>(contentResolverJava);
+	Framework::Android::CContentResolver::GetInstance().SetContentResolver(std::move(contentResolver));
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_virtualapplications_play_NativeInterop_createVirtualMachine(JNIEnv* env, jobject obj)
@@ -82,10 +116,12 @@ extern "C" JNIEXPORT void JNICALL Java_com_virtualapplications_play_NativeIntero
 	g_virtualMachine->Initialize();
 	g_virtualMachine->CreatePadHandler(CPH_Generic::GetFactoryFunction());
 #ifdef PROFILE
-	g_ProfileFrameDoneConnection = g_virtualMachine->ProfileFrameDone.Connect(std::bind(&CStatsManager::OnProfileFrameDone, &CStatsManager::GetInstance(), g_virtualMachine, std::placeholders::_1));
+	g_ProfileFrameDoneConnection = g_virtualMachine->ProfileFrameDone.Connect(std::bind(&CStatsManager::OnProfileFrameDone, &CStatsManager::GetInstance(), std::placeholders::_1));
 #endif
+	CAppConfig::GetInstance().RegisterPreferenceInteger(PREF_VIDEO_GS_HANDLER, PREFERENCE_VALUE_VIDEO_GS_HANDLER_OPENGL);
 	CAppConfig::GetInstance().RegisterPreferenceBoolean(PREF_AUDIO_ENABLEOUTPUT, true);
 	CGSH_OpenGL::RegisterPreferences();
+	g_currentGsHandlerId = -1;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL Java_com_virtualapplications_play_NativeInterop_isVirtualMachineCreated(JNIEnv* env, jobject obj)
@@ -170,14 +206,41 @@ extern "C" JNIEXPORT void JNICALL Java_com_virtualapplications_play_NativeIntero
 {
 	auto nativeWindow = ANativeWindow_fromSurface(env, surface);
 	auto gsHandler = g_virtualMachine->GetGSHandler();
-	if(gsHandler == nullptr)
+	int gsHandlerId = CAppConfig::GetInstance().GetPreferenceInteger(PREF_VIDEO_GS_HANDLER);
+	bool recreateNeeded = (gsHandler == nullptr) || (g_currentGsHandlerId != gsHandlerId);
+	if(recreateNeeded)
 	{
-		g_virtualMachine->CreateGSHandler(CGSH_OpenGLAndroid::GetFactoryFunction(nativeWindow));
+		switch(gsHandlerId)
+		{
+		default:
+		case PREFERENCE_VALUE_VIDEO_GS_HANDLER_OPENGL:
+			g_virtualMachine->CreateGSHandler(CGSH_OpenGLAndroid::GetFactoryFunction(nativeWindow));
+			break;
+		case PREFERENCE_VALUE_VIDEO_GS_HANDLER_VULKAN:
+			g_virtualMachine->CreateGSHandler(CGSH_VulkanAndroid::GetFactoryFunction(nativeWindow));
+			break;
+		}
+		g_currentGsHandlerId = gsHandlerId;
 		g_OnNewFrameConnection = g_virtualMachine->m_ee->m_gs->OnNewFrame.Connect(
-		    std::bind(&CStatsManager::OnNewFrame, &CStatsManager::GetInstance(), std::placeholders::_1));
+		    std::bind(&CStatsManager::OnNewFrame, &CStatsManager::GetInstance(), g_virtualMachine, std::placeholders::_1));
 	}
 	else
 	{
-		static_cast<CGSH_OpenGLAndroid*>(gsHandler)->SetWindow(nativeWindow);
+		if(auto windowUpdateListener = dynamic_cast<INativeWindowUpdateListener*>(gsHandler))
+		{
+			windowUpdateListener->SetWindow(nativeWindow);
+		}
+	}
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_virtualapplications_play_NativeInterop_notifyPreferencesChanged(JNIEnv* env, jobject obj)
+{
+	SetupSoundHandler();
+	g_virtualMachine->ReloadSpuBlockCount();
+	g_virtualMachine->ReloadFrameRateLimit();
+	auto gsHandler = g_virtualMachine->GetGSHandler();
+	if(gsHandler != nullptr)
+	{
+		gsHandler->NotifyPreferencesChanged();
 	}
 }

@@ -35,10 +35,19 @@ add_library(gsh_vulkan STATIC
 	GSH_VulkanDeviceInfo.h
 	GSH_VulkanDraw.cpp
 	GSH_VulkanDraw.h
+	GSH_VulkanDrawDesktop.cpp
+	GSH_VulkanDrawDesktop.h
+	GSH_VulkanDrawMobile.cpp
+	GSH_VulkanDrawMobile.h
+	GSH_VulkanDrawUtils.cpp
+	GSH_VulkanDrawUtils.h
 	GSH_VulkanFrameCommandBuffer.cpp
 	GSH_VulkanFrameCommandBuffer.h
 	GSH_VulkanMemoryUtils.cpp
 	GSH_VulkanMemoryUtils.h
+	GSH_VulkanOffscreen.cpp
+	GSH_VulkanOffscreen.h
+	GSH_VulkanPlatformDefs.h
 	GSH_VulkanPipelineCache.h
 	GSH_VulkanPresent.cpp
 	GSH_VulkanPresent.h

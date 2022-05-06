@@ -92,7 +92,7 @@ VkDescriptorSet CClutLoad::PrepareDescriptorSet(VkDescriptorSetLayout descriptor
 
 		VkDescriptorBufferInfo descriptorClutBufferInfo = {};
 		descriptorClutBufferInfo.buffer = m_context->clutBuffer;
-		descriptorClutBufferInfo.range = VK_WHOLE_SIZE;
+		descriptorClutBufferInfo.range = sizeof(uint32) * CGSHandler::CLUTENTRYCOUNT;
 
 		VkDescriptorImageInfo descriptorSwizzleTableImageInfo = {};
 		descriptorSwizzleTableImageInfo.imageView = m_context->GetSwizzleTable(cpsm);
@@ -204,6 +204,7 @@ Framework::Vulkan::CShaderModule CClutLoad::CreateLoadShader(const PIPELINE_CAPS
 			}
 			break;
 			case CGSHandler::PSMCT16:
+			case CGSHandler::PSMCT16S:
 			{
 				auto colorAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMCT16>(
 				    b, swizzleTable, clutBufPtr, clutBufWidth, colorPos);
@@ -249,6 +250,7 @@ Framework::Vulkan::CShaderModule CClutLoad::CreateLoadShader(const PIPELINE_CAPS
 		}
 		break;
 		case CGSHandler::PSMCT16:
+		case CGSHandler::PSMCT16S:
 		{
 			Store(clutBuffer, clutIndex, colorPixel);
 		}

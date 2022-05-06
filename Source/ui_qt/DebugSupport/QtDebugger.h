@@ -42,6 +42,7 @@ private slots:
 	void on_actionCascade_triggered();
 	void on_actionTile_triggered();
 	void on_actionLayout_1024x768_triggered();
+	void on_actionLayout_1280x800_triggered();
 	void on_actionLayout_1280x1024_triggered();
 	void on_actionLayout_1600x1200_triggered();
 
@@ -50,6 +51,7 @@ private slots:
 
 	void on_actionCall_Stack_triggered();
 	void on_actionFunctions_triggered();
+	void on_actionELF_File_Information_triggered();
 	void on_actionThreads_triggered();
 	void on_actionView_Disassmebly_triggered();
 	void on_actionView_Registers_triggered();
@@ -90,9 +92,10 @@ private:
 	void AssembleJAL();
 	void ReanalyzeEe();
 	void FindEeFunctions();
-	void Layout1024();
-	void Layout1280();
-	void Layout1600();
+	void Layout1024x768();
+	void Layout1280x800();
+	void Layout1280x1024();
+	void Layout1600x1200();
 	void LoadDebugTags();
 	void SaveDebugTags();
 
@@ -105,7 +108,6 @@ private:
 	void SaveBytesPerLine();
 
 	CDebugView* GetCurrentView();
-	CMIPS* GetContext();
 	CDisAsmWnd* GetDisassemblyWindow();
 	CMemoryViewMIPSWnd* GetMemoryViewWindow();
 	CRegViewWnd* GetRegisterViewWindow();
@@ -133,8 +135,8 @@ private:
 	CAddressListViewWnd::AddressSelectedEvent::Connection m_AddressSelectedConnection;
 	Framework::CSignal<void()>::Connection m_OnExecutableChangeConnection;
 	Framework::CSignal<void()>::Connection m_OnExecutableUnloadingConnection;
-	Framework::CSignal<void()>::Connection m_OnMachineStateChangeConnection;
-	Framework::CSignal<void()>::Connection m_OnRunningStateChangeConnection;
+	CVirtualMachine::MachineStateChangeEvent::Connection m_OnMachineStateChangeConnection;
+	CVirtualMachine::RunningStateChangeEvent::Connection m_OnRunningStateChangeConnection;
 
 	CDisAsmWnd::FindCallersRequestedEvent::Connection m_findCallersRequestConnection;
 

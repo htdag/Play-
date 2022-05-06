@@ -97,6 +97,7 @@ CGSHandler::CGSHandler(bool gsThreaded)
 	m_transferReadHandlers[PSMCT24] = &CGSHandler::TransferReadHandlerPSMCT24;
 	m_transferReadHandlers[PSMCT16] = &CGSHandler::TransferReadHandlerGeneric<CGsPixelFormats::STORAGEPSMCT16>;
 	m_transferReadHandlers[PSMT8] = &CGSHandler::TransferReadHandlerGeneric<CGsPixelFormats::STORAGEPSMT8>;
+	m_transferReadHandlers[PSMT8H] = &CGSHandler::TransferReadHandlerPSMT8H;
 	m_transferReadHandlers[PSMZ32] = &CGSHandler::TransferReadHandlerGeneric<CGsPixelFormats::STORAGEPSMZ32>;
 
 	ResetBase();
@@ -122,6 +123,7 @@ CGSHandler::~CGSHandler()
 void CGSHandler::RegisterPreferences()
 {
 	CAppConfig::GetInstance().RegisterPreferenceInteger(PREF_CGSHANDLER_PRESENTATION_MODE, CGSHandler::PRESENTATION_MODE_FIT);
+	CAppConfig::GetInstance().RegisterPreferenceBoolean(PREF_CGSHANDLER_GS_RAM_READS_ENABLED, true);
 	CAppConfig::GetInstance().RegisterPreferenceBoolean(PREF_CGSHANDLER_WIDESCREEN, false);
 }
 
@@ -147,6 +149,7 @@ void CGSHandler::ResetBase()
 	m_nReg[GS_REG_PRMODECONT] = 1;
 	memset(m_pRAM, 0, RAMSIZE);
 	memset(m_pCLUT, 0, CLUTSIZE);
+	memset(&m_trxCtx, 0, sizeof(m_trxCtx));
 	m_nPMODE = 0;
 	m_nSMODE2 = 0x3; // Interlacing with fullframe
 	m_nDISPFB1.heldValue = 0;
@@ -322,9 +325,33 @@ void CGSHandler::Copy(CGSHandler* source)
 	SendGSCall([&]() { WriteBackMemoryCache(); });
 }
 
-void CGSHandler::SetFrameDump(CFrameDump* frameDump)
+void CGSHandler::BeginFrameDump(CFrameDump* frameDump)
 {
 	m_frameDump = frameDump;
+
+	//This is expected to be called from the GS thread
+	SyncMemoryCache();
+
+	memcpy(m_frameDump->GetInitialGsRam(), GetRam(), RAMSIZE);
+	memcpy(m_frameDump->GetInitialGsRegisters(), GetRegisters(), CGSHandler::REGISTER_MAX * sizeof(uint64));
+	m_frameDump->SetInitialSMODE2(GetSMODE2());
+}
+
+void CGSHandler::EndFrameDump()
+{
+	assert(m_frameDump);
+	m_frameDump = nullptr;
+}
+
+void CGSHandler::InitFromFrameDump(CFrameDump* frameDump)
+{
+	//This is expected to be called from outside the GS thread
+
+	memcpy(GetRam(), frameDump->GetInitialGsRam(), RAMSIZE);
+	memcpy(GetRegisters(), frameDump->GetInitialGsRegisters(), CGSHandler::REGISTER_MAX * sizeof(uint64));
+	SetSMODE2(frameDump->GetInitialSMODE2());
+
+	SendGSCall([&]() { WriteBackMemoryCache(); });
 }
 
 bool CGSHandler::GetDrawEnabled() const
@@ -1134,6 +1161,30 @@ void CGSHandler::TransferReadHandlerPSMCT24(void* buffer, uint32 length)
 	}
 }
 
+void CGSHandler::TransferReadHandlerPSMT8H(void* buffer, uint32 length)
+{
+	auto trxPos = make_convertible<TRXPOS>(m_nReg[GS_REG_TRXPOS]);
+	auto trxReg = make_convertible<TRXREG>(m_nReg[GS_REG_TRXREG]);
+	auto trxBuf = make_convertible<BITBLTBUF>(m_nReg[GS_REG_BITBLTBUF]);
+
+	auto dst = reinterpret_cast<uint8*>(buffer);
+
+	CGsPixelFormats::CPixelIndexorPSMCT32 indexor(GetRam(), trxBuf.GetSrcPtr(), trxBuf.nSrcWidth);
+	for(uint32 i = 0; i < length; i++)
+	{
+		uint32 x = (m_trxCtx.nRRX + trxPos.nSSAX) % 2048;
+		uint32 y = (m_trxCtx.nRRY + trxPos.nSSAY) % 2048;
+		auto pixel = indexor.GetPixel(x, y);
+		dst[i] = static_cast<uint8>(pixel >> 24);
+		m_trxCtx.nRRX++;
+		if(m_trxCtx.nRRX == trxReg.nRRW)
+		{
+			m_trxCtx.nRRX = 0;
+			m_trxCtx.nRRY++;
+		}
+	}
+}
+
 void CGSHandler::SetCrt(bool nIsInterlaced, unsigned int nMode, bool nIsFrameMode)
 {
 	m_crtMode = static_cast<CRT_MODE>(nMode);
@@ -1229,6 +1280,31 @@ std::pair<uint64, uint64> CGSHandler::GetCurrentDisplayInfo()
 	case 1:
 		return {m_nDISPFB2.value.q, m_nDISPLAY2.value.q};
 	}
+}
+
+std::pair<uint32, uint32> CGSHandler::GetDisplayBounds(uint64 displayReg) const
+{
+	auto d = make_convertible<DISPLAY>(displayReg);
+
+	uint32 dispWidth = (d.nW + 1) / (d.nMagX + 1);
+	uint32 dispHeight = (d.nH + 1);
+
+	//Some games provide a huge height but seem to only need a fraction
+	//of what they need:
+	//- Silent Hill 3
+	//- Metal Slug 4
+	//- Shooting Love: Trizeal
+	//- And many others...
+	//Does the PCRTC clamp the values?
+	if(dispHeight > 640)
+	{
+		dispHeight /= 2;
+	}
+
+	bool halfHeight = GetCrtIsInterlaced() && GetCrtIsFrameMode();
+	if(halfHeight) dispHeight /= 2;
+
+	return std::make_pair(dispWidth, dispHeight);
 }
 
 unsigned int CGSHandler::GetCurrentReadCircuit()

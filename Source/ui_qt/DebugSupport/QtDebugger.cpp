@@ -390,7 +390,7 @@ void QtDebugger::FindEeFunctions()
 	m_virtualMachine.m_ee->m_EE.m_Functions.OnTagListChange();
 }
 
-void QtDebugger::Layout1024()
+void QtDebugger::Layout1024x768()
 {
 	static_cast<QWidget*>(GetDisassemblyWindow()->parent())->setGeometry(0, 0, 700, 435);
 	static_cast<QWidget*>(GetDisassemblyWindow()->parent())->show();
@@ -409,7 +409,26 @@ void QtDebugger::Layout1024()
 	GetCallStackWindow()->show();
 }
 
-void QtDebugger::Layout1280()
+void QtDebugger::Layout1280x800()
+{
+	static_cast<QWidget*>(GetDisassemblyWindow()->parent())->setGeometry(0, 0, 1100, 475);
+	static_cast<QWidget*>(GetDisassemblyWindow()->parent())->show();
+	GetDisassemblyWindow()->show();
+
+	static_cast<QWidget*>(GetRegisterViewWindow()->parent())->setGeometry(1100, 0, 325, 475);
+	static_cast<QWidget*>(GetRegisterViewWindow()->parent())->show();
+	GetRegisterViewWindow()->show();
+
+	static_cast<QWidget*>(GetMemoryViewWindow()->parent())->setGeometry(0, 475, 1100, 265);
+	static_cast<QWidget*>(GetMemoryViewWindow()->parent())->show();
+	GetMemoryViewWindow()->show();
+
+	static_cast<QWidget*>(GetCallStackWindow()->parent())->setGeometry(1100, 475, 325, 265);
+	static_cast<QWidget*>(GetCallStackWindow()->parent())->show();
+	GetCallStackWindow()->show();
+}
+
+void QtDebugger::Layout1280x1024()
 {
 	static_cast<QWidget*>(GetDisassemblyWindow()->parent())->setGeometry(0, 0, 900, 540);
 	static_cast<QWidget*>(GetDisassemblyWindow()->parent())->show();
@@ -428,7 +447,7 @@ void QtDebugger::Layout1280()
 	GetCallStackWindow()->show();
 }
 
-void QtDebugger::Layout1600()
+void QtDebugger::Layout1600x1200()
 {
 	static_cast<QWidget*>(GetDisassemblyWindow()->parent())->setGeometry(0, 0, 1094, 725);
 	static_cast<QWidget*>(GetDisassemblyWindow()->parent())->show();
@@ -560,12 +579,6 @@ CDebugView* QtDebugger::GetCurrentView()
 {
 	if(m_nCurrentView == -1) return NULL;
 	return m_pView[m_nCurrentView];
-}
-
-CMIPS* QtDebugger::GetContext()
-{
-	return nullptr;
-	return GetCurrentView()->GetContext();
 }
 
 CDisAsmWnd* QtDebugger::GetDisassemblyWindow()
@@ -769,17 +782,22 @@ void QtDebugger::on_actionTile_triggered()
 
 void QtDebugger::on_actionLayout_1024x768_triggered()
 {
-	Layout1024();
+	Layout1024x768();
+}
+
+void QtDebugger::on_actionLayout_1280x800_triggered()
+{
+	Layout1280x800();
 }
 
 void QtDebugger::on_actionLayout_1280x1024_triggered()
 {
-	Layout1280();
+	Layout1280x1024();
 }
 
 void QtDebugger::on_actionLayout_1600x1200_triggered()
 {
-	Layout1600();
+	Layout1600x1200();
 }
 
 void QtDebugger::on_actionfind_word_value_triggered()
@@ -803,6 +821,12 @@ void QtDebugger::on_actionFunctions_triggered()
 {
 	m_pFunctionsView->show();
 	m_pFunctionsView->setFocus(Qt::ActiveWindowFocusReason);
+}
+
+void QtDebugger::on_actionELF_File_Information_triggered()
+{
+	m_pELFView->show();
+	m_pELFView->setFocus(Qt::ActiveWindowFocusReason);
 }
 
 void QtDebugger::on_actionThreads_triggered()

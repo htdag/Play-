@@ -80,7 +80,7 @@ public:
 	CPU_UTILISATION_INFO GetCpuUtilisationInfo() const;
 
 #ifdef DEBUGGER_INCLUDED
-	std::string MakeDebugTagsPackagePath(const char*);
+	fs::path MakeDebugTagsPackagePath(const char*);
 	void LoadDebugTags(const char*);
 	void SaveDebugTags(const char*);
 #endif
@@ -92,10 +92,15 @@ public:
 
 	ProfileFrameDoneSignal ProfileFrameDone;
 
+protected:
+	virtual void CreateVM();
+	void ResumeImpl();
+
+	CMailBox m_mailBox;
+
 private:
 	typedef std::unique_ptr<COpticalMedia> OpticalMediaPtr;
 
-	void CreateVM();
 	void ResetVM();
 	void DestroyVM();
 	bool SaveVMState(const fs::path&);
@@ -104,7 +109,6 @@ private:
 	void ReloadExecutable(const char*, const CPS2OS::ArgumentList&);
 	void OnCrtModeChange();
 
-	void ResumeImpl();
 	void PauseImpl();
 	void DestroyImpl();
 
@@ -132,7 +136,6 @@ private:
 	void EmuThread();
 
 	std::thread m_thread;
-	CMailBox m_mailBox;
 	STATUS m_nStatus;
 	bool m_nEnd;
 

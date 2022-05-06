@@ -34,6 +34,8 @@ CELFHeaderView::CELFHeaderView(QMdiSubWindow* parent, QLayout* groupBoxLayout)
 		m_layout->addLayout(horizontalLayout);
 	}
 
+	m_layout->addStretch();
+
 	groupBoxLayout->addWidget(this);
 	hide();
 }
@@ -56,7 +58,7 @@ void CELFHeaderView::FillInformation()
 {
 	int i = 0;
 	std::string sTemp;
-	const ELFHEADER* pH = &m_pELF->GetHeader();
+	auto pH = &m_pELF->GetHeader();
 
 	switch(pH->nType)
 	{
@@ -106,6 +108,9 @@ void CELFHeaderView::FillInformation()
 		break;
 	case CELF::EM_MIPS:
 		sTemp = ("EM_MIPS");
+		break;
+	case CELF::EM_PPC64:
+		sTemp = ("EM_PPC64");
 		break;
 	case CELF::EM_ARM:
 		sTemp = ("EM_ARM");
